@@ -1,0 +1,10 @@
+.environment-create-form {
+  padding: var(--spacing-xl);
+  max-width: 720px;
+}
+
+.environment-create-form h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-xl);
+}

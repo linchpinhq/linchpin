@@ -1,0 +1,60 @@
+.environment-list-view {
+  padding: var(--spacing-xl);
+}
+
+.environment-list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--spacing-lg);
+}
+
+.environment-list-header h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-xs);
+}
+
+.environment-list-header p {
+  color: var(--color-text-secondary);
+  font-size: 0.875rem;
+}
+
+.environment-list-table-wrapper {
+  overflow-x: auto;
+}
+
+.environment-list-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.environment-list-table thead th {
+  text-align: left;
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.environment-list-table tbody td {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-bottom: 1px solid var(--color-border-light);
+  color: var(--color-text-primary);
+}
+
+.environment-row {
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.environment-row:hover {
+  background-color: var(--color-bg-secondary);
+}
+
+.environment-row:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}

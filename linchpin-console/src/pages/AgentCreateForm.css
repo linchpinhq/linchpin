@@ -1,0 +1,233 @@
+.agent-create-form {
+  padding: var(--spacing-xl);
+  max-width: 720px;
+}
+
+.back-link {
+  display: inline-block;
+  font-size: 0.8125rem;
+  color: var(--color-primary);
+  margin-bottom: var(--spacing-lg);
+}
+
+.back-link:hover {
+  color: var(--color-primary-hover);
+}
+
+.agent-create-form h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-xl);
+}
+
+/* Form sections */
+.form-section {
+  margin-bottom: var(--spacing-xl);
+}
+
+.form-section h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-md);
+  padding-bottom: var(--spacing-sm);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+/* Form fields */
+.form-field {
+  margin-bottom: var(--spacing-md);
+}
+
+.form-field label {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--spacing-xs);
+}
+
+.form-field input[type="text"],
+.form-field select,
+.form-field textarea {
+  width: 100%;
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 0.8125rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  transition: border-color 0.15s ease;
+}
+
+.form-field input[type="text"]:focus,
+.form-field select:focus,
+.form-field textarea:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.form-field textarea {
+  min-height: 120px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
+/* Dynamic entries (tools, MCP servers) */
+.dynamic-entries {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.dynamic-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+}
+
+.dynamic-entry .entry-fields {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+}
+
+.dynamic-entry .entry-fields .form-field {
+  margin-bottom: 0;
+  flex: 1;
+  min-width: 140px;
+}
+
+.dynamic-entry .entry-fields .form-field.full-width {
+  flex-basis: 100%;
+}
+
+.btn-remove {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.75rem;
+  color: var(--color-danger);
+  background: none;
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  margin-top: 1.25rem;
+}
+
+.btn-remove:hover {
+  background: rgba(229, 57, 53, 0.08);
+}
+
+.btn-add {
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-primary);
+  background: none;
+  border: 1px dashed var(--color-primary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  margin-top: var(--spacing-sm);
+}
+
+.btn-add:hover {
+  background: rgba(0, 113, 227, 0.06);
+}
+
+/* Env key-value pairs */
+.env-pairs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.env-pair {
+  display: flex;
+  gap: var(--spacing-xs);
+  align-items: center;
+}
+
+.env-pair input {
+  flex: 1;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+}
+
+.env-pair input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.env-pair .btn-remove-sm {
+  padding: 2px 6px;
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.env-pair .btn-remove-sm:hover {
+  color: var(--color-danger);
+}
+
+.btn-add-sm {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.75rem;
+  color: var(--color-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.btn-add-sm:hover {
+  text-decoration: underline;
+}
+
+/* Submit area */
+.form-actions {
+  padding-top: var(--spacing-lg);
+  border-top: 1px solid var(--color-border-light);
+}
+
+.btn-submit {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #fff;
+  background-color: var(--color-primary);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.btn-submit:hover:not(:disabled) {
+  background-color: var(--color-primary-hover);
+}
+
+.btn-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Error display */
+.form-error {
+  padding: var(--spacing-sm) var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  background: rgba(229, 57, 53, 0.08);
+  border: 1px solid rgba(229, 57, 53, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--color-danger);
+  font-size: 0.8125rem;
+}

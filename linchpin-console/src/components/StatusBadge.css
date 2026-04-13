@@ -1,0 +1,64 @@
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.4;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.status-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-badge--running {
+  color: var(--color-status-running);
+  background-color: rgba(52, 199, 89, 0.12);
+}
+
+.status-badge--running .status-badge-dot {
+  background-color: var(--color-status-running);
+}
+
+.status-badge--idle {
+  color: var(--color-status-idle);
+  background-color: rgba(0, 122, 255, 0.12);
+}
+
+.status-badge--idle .status-badge-dot {
+  background-color: var(--color-status-idle);
+}
+
+.status-badge--rescheduling {
+  color: var(--color-status-rescheduling);
+  background-color: rgba(255, 159, 10, 0.12);
+}
+
+.status-badge--rescheduling .status-badge-dot {
+  background-color: var(--color-status-rescheduling);
+}
+
+.status-badge--terminated {
+  color: var(--color-status-terminated);
+  background-color: rgba(142, 142, 147, 0.12);
+}
+
+.status-badge--terminated .status-badge-dot {
+  background-color: var(--color-status-terminated);
+}
+
+.status-badge--failed {
+  color: var(--color-status-failed);
+  background-color: rgba(255, 59, 48, 0.12);
+}
+
+.status-badge--failed .status-badge-dot {
+  background-color: var(--color-status-failed);
+}

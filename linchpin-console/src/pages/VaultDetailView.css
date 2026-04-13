@@ -1,0 +1,146 @@
+.vault-detail-view {
+  padding: var(--spacing-xl);
+}
+
+.vault-detail-header {
+  margin-bottom: var(--spacing-xl);
+}
+
+.vault-detail-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-xs);
+}
+
+.vault-detail-title-row h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.vault-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+  flex-wrap: wrap;
+}
+
+.vault-detail-meta code {
+  font-size: 0.75rem;
+}
+
+/* Credential list */
+.credential-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.credential-card {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  font-size: 0.8125rem;
+}
+
+.credential-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.credential-card-type {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  color: var(--color-primary);
+  margin-bottom: 2px;
+}
+
+.credential-card-target {
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+
+.credential-card-meta {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+
+.credential-card-secret {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  letter-spacing: 0.1em;
+}
+
+.credential-card-actions {
+  display: flex;
+  gap: var(--spacing-xs);
+  flex-shrink: 0;
+}
+
+/* Add credential form */
+.add-credential-form {
+  padding: var(--spacing-md);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--spacing-md);
+}
+
+.add-credential-form .form-row {
+  display: flex;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  margin-bottom: var(--spacing-sm);
+}
+
+.add-credential-form .form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  flex: 1;
+  min-width: 180px;
+}
+
+.add-credential-form label {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+}
+
+.add-credential-form select,
+.add-credential-form input {
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 0.8125rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+}
+
+.add-credential-form select:focus,
+.add-credential-form input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.add-credential-form-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+.form-error {
+  font-size: 0.75rem;
+  color: var(--color-danger);
+  margin-top: var(--spacing-xs);
+}

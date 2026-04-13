@@ -1,0 +1,234 @@
+.event-stream-panel {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  max-height: 600px;
+  min-height: 300px;
+}
+
+.event-stream-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.event-stream-empty {
+  text-align: center;
+  color: var(--color-text-muted);
+  padding: var(--spacing-xl);
+  font-size: 0.875rem;
+}
+
+.event-stream-load-more {
+  text-align: center;
+  padding: var(--spacing-sm);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.event-stream-load-more button {
+  font-size: 0.75rem;
+  color: var(--color-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: var(--spacing-xs) var(--spacing-sm);
+}
+
+.event-stream-load-more button:hover {
+  color: var(--color-primary-hover);
+}
+
+.event-stream-load-more button:disabled {
+  color: var(--color-text-muted);
+  cursor: default;
+}
+
+/* Event bubbles */
+.event-bubble {
+  max-width: 80%;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-md);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* user.message — blue, left-aligned */
+.event-bubble--user-message {
+  align-self: flex-start;
+  background: #e3f2fd;
+  color: #0d47a1;
+  border-bottom-left-radius: var(--radius-sm);
+}
+
+/* agent.message — gray, right-aligned */
+.event-bubble--agent-message {
+  align-self: flex-end;
+  background: var(--color-bg-secondary);
+  color: var(--color-text-primary);
+  border-bottom-right-radius: var(--radius-sm);
+}
+
+/* agent.thinking — italic gray */
+.event-bubble--agent-thinking {
+  align-self: flex-end;
+  font-style: italic;
+  color: var(--color-text-secondary);
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 0.75rem;
+}
+
+/* tool use / tool result — code card */
+.event-bubble--tool {
+  align-self: stretch;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: var(--spacing-sm) var(--spacing-md);
+}
+
+.event-bubble--tool .tool-label {
+  font-weight: 600;
+  margin-bottom: var(--spacing-xs);
+  font-family: var(--font-family);
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+.event-bubble--tool pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* session.* — centered status pill */
+.event-bubble--status {
+  align-self: center;
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  padding: var(--spacing-xs) var(--spacing-md);
+  border-radius: 999px;
+}
+
+/* session.error — red error card */
+.event-bubble--error {
+  align-self: stretch;
+  background: #fdecea;
+  color: var(--color-danger);
+  border: 1px solid #f5c6cb;
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 0.8125rem;
+}
+
+/* session.requires_action — highlighted pending */
+.event-bubble--requires-action {
+  align-self: stretch;
+  background: #fff8e1;
+  border: 1px solid #ffe082;
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+}
+
+/* Markdown rendering inside agent messages */
+.event-bubble--agent-message h1,
+.event-bubble--agent-message h2,
+.event-bubble--agent-message h3 {
+  margin-top: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.event-bubble--agent-message h3 {
+  font-size: 0.8125rem;
+}
+
+.event-bubble--agent-message p {
+  margin: var(--spacing-xs) 0;
+}
+
+.event-bubble--agent-message pre {
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm);
+  overflow-x: auto;
+  font-size: 0.75rem;
+  margin: var(--spacing-xs) 0;
+}
+
+.event-bubble--agent-message code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.event-bubble--agent-message pre code {
+  background: none;
+  padding: 0;
+}
+
+.event-bubble--agent-message ul,
+.event-bubble--agent-message ol {
+  margin: var(--spacing-xs) 0;
+  padding-left: var(--spacing-lg);
+}
+
+.event-bubble--agent-message table {
+  border-collapse: collapse;
+  margin: var(--spacing-sm) 0;
+  font-size: 0.75rem;
+  width: 100%;
+}
+
+.event-bubble--agent-message th,
+.event-bubble--agent-message td {
+  border: 1px solid var(--color-border-light);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  text-align: left;
+}
+
+.event-bubble--agent-message th {
+  background: rgba(0, 0, 0, 0.03);
+  font-weight: 600;
+}
+
+.event-bubble--agent-message strong {
+  font-weight: 600;
+}
+
+.event-bubble--agent-message hr {
+  border: none;
+  border-top: 1px solid var(--color-border-light);
+  margin: var(--spacing-sm) 0;
+}
+
+/* Streaming message bubble indicator */
+.event-bubble--streaming {
+  position: relative;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  background: var(--color-text-secondary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink-cursor 0.8s step-end infinite;
+}
+
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

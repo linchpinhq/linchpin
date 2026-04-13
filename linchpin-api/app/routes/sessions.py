@@ -1,0 +1,567 @@
+"""Session CRUD endpoints.
+
+POST   /v1/sessions              — Create session
+GET    /v1/sessions              — List sessions (paginated, optional agent_id filter)
+GET    /v1/sessions/{id}         — Get session by id with stats and usage
+POST   /v1/sessions/{id}         — Update session title/metadata
+DELETE /v1/sessions/{id}         — Terminate session (set status=terminated, destroy container)
+POST   /v1/sessions/{id}/archive — Archive session (set archived_at)
+
+Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.6, 6.5, 19.2, 19.3, 20.1, 20.2, 20.3
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from sse_starlette.sse import EventSourceResponse
+
+from app.db import fetch_all, fetch_one, execute, listen, notify
+from app.events import append_event, decode_cursor, get_events
+from app.orchestrator import run_session
+from app.streaming import get_stream
+from app.models import (
+    CreateSessionRequest,
+    EventResponse,
+    PaginatedEventsResponse,
+    PaginatedListResponse,
+    PostEventsRequest,
+    SessionResponse,
+    SessionStats,
+    SessionUsage,
+)
+
+logger = logging.getLogger("linchpin-api.sessions")
+
+router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+def _row_to_session(row) -> SessionResponse:
+    """Convert an asyncpg Record to a SessionResponse."""
+    stats_raw = row["stats"]
+    usage_raw = row["usage"]
+    metadata_raw = row["metadata"]
+
+    stats = json.loads(stats_raw) if isinstance(stats_raw, str) else stats_raw
+    usage = json.loads(usage_raw) if isinstance(usage_raw, str) else usage_raw
+    metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+
+    # Parse vault_ids — may be a JSON string, list, or missing
+    vault_ids_raw = row.get("vault_ids", [])
+    if vault_ids_raw is None:
+        vault_ids = []
+    elif isinstance(vault_ids_raw, str):
+        vault_ids = json.loads(vault_ids_raw)
+    else:
+        vault_ids = vault_ids_raw
+
+    return SessionResponse(
+        id=str(row["id"]),
+        agent_id=str(row["agent_id"]),
+        agent_version=row["agent_version"],
+        environment_id=str(row["environment_id"]),
+        status=row["status"],
+        container_id=row["container_id"],
+        title=row["title"],
+        metadata=metadata,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        archived_at=row["archived_at"],
+        last_event_cursor=row["last_event_cursor"],
+        ttl_seconds=row["ttl_seconds"],
+        stats=SessionStats(**stats),
+        usage=SessionUsage(**usage),
+        vault_ids=vault_ids,
+    )
+
+
+def _network_for_environment(config: dict) -> str:
+    """Determine the Docker network name from an environment config dict."""
+    networking = config.get("networking", {})
+    net_type = networking.get("type", "none")
+    if net_type == "unrestricted":
+        return "linchpin-open"
+    return "linchpin-none"
+
+
+@router.post("", status_code=201, response_model=SessionResponse)
+async def create_session(body: CreateSessionRequest, request: Request) -> SessionResponse:
+    """Create a new session: validate refs, provision container, insert record."""
+    # Validate agent_id exists
+    try:
+        agent_uid = uuid.UUID(body.agent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Agent {body.agent_id} not found"},
+        )
+
+    agent_row = await fetch_one("SELECT * FROM agents WHERE id = $1", agent_uid)
+    if agent_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Agent {body.agent_id} not found"},
+        )
+
+    # Validate environment_id exists
+    try:
+        env_uid = uuid.UUID(body.environment_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Environment {body.environment_id} not found"},
+        )
+
+    env_row = await fetch_one("SELECT * FROM environments WHERE id = $1", env_uid)
+    if env_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Environment {body.environment_id} not found"},
+        )
+
+    # Validate vault_ids: each must exist and not be archived
+    if body.vault_ids:
+        for vid in body.vault_ids:
+            try:
+                vault_uid = uuid.UUID(vid)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Invalid vault id: {vid}",
+                    },
+                )
+            vault_row = await fetch_one("SELECT id, archived_at FROM vaults WHERE id = $1", vault_uid)
+            if vault_row is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Vault {vid} not found",
+                    },
+                )
+            if vault_row["archived_at"] is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Vault {vid} is archived",
+                    },
+                )
+
+    # Determine network from environment config
+    env_config = env_row["config"]
+    if isinstance(env_config, str):
+        env_config = json.loads(env_config)
+    network = _network_for_environment(env_config)
+
+    # Provision Docker container via sandbox
+    sandbox = request.app.state.sandbox
+    image = ""  # empty string lets DockerSandbox use default/env var
+    container_id = await sandbox.create(image, network)
+
+    # Insert session record
+    session_id = str(uuid.uuid4())
+    agent_version = agent_row["version"]
+    metadata_json = json.dumps(body.metadata)
+    vault_ids_json = json.dumps(body.vault_ids)
+    stats_json = json.dumps({"total_events": 0, "tool_calls": 0, "model_turns": 0})
+    usage_json = json.dumps({"input_tokens": 0, "output_tokens": 0})
+
+    row = await fetch_one(
+        """
+        INSERT INTO sessions
+            (id, agent_id, agent_version, environment_id, status,
+             container_id, title, metadata, ttl_seconds, vault_ids, stats, usage)
+        VALUES ($1, $2, $3, $4, 'running',
+                $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, $11::jsonb)
+        RETURNING *
+        """,
+        uuid.UUID(session_id),
+        agent_uid,
+        agent_version,
+        env_uid,
+        container_id,
+        body.title,
+        metadata_json,
+        body.ttl_seconds,
+        vault_ids_json,
+        stats_json,
+        usage_json,
+    )
+
+    # Start the orchestrator loop as a background async task
+    task = asyncio.create_task(run_session(session_id, sandbox))
+
+    def _task_done(t: asyncio.Task) -> None:
+        exc = t.exception() if not t.cancelled() else None
+        if exc:
+            logger.error("Orchestrator task for session %s failed: %s", session_id, exc)
+
+    task.add_done_callback(_task_done)
+    request.app.state.orchestrator_tasks[session_id] = task
+
+    return _row_to_session(row)
+
+
+@router.get("", response_model=PaginatedListResponse)
+async def list_sessions(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    agent_id: str | None = Query(default=None),
+) -> PaginatedListResponse:
+    """Return a paginated list of sessions, optionally filtered by agent_id."""
+    if agent_id is not None:
+        try:
+            agent_uid = uuid.UUID(agent_id)
+        except ValueError:
+            return PaginatedListResponse(data=[], has_more=False, next_cursor=None)
+
+        rows = await fetch_all(
+            """SELECT * FROM sessions
+               WHERE agent_id = $1
+               ORDER BY created_at DESC
+               LIMIT $2 OFFSET $3""",
+            agent_uid,
+            limit + 1,
+            offset,
+        )
+    else:
+        rows = await fetch_all(
+            "SELECT * FROM sessions ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            limit + 1,
+            offset,
+        )
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    sessions = [_row_to_session(r) for r in items]
+
+    return PaginatedListResponse(data=sessions, has_more=has_more, next_cursor=None)
+
+
+@router.get("/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str) -> SessionResponse:
+    """Retrieve a session by id with stats and usage."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+    return _row_to_session(row)
+
+
+@router.post("/{session_id}", response_model=SessionResponse)
+async def update_session(session_id: str, body: dict[str, Any]) -> SessionResponse:
+    """Update session title and/or metadata."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Build SET clauses for provided fields
+    sets: list[str] = ["updated_at = now()"]
+    args: list[Any] = []
+    idx = 1
+
+    if "title" in body:
+        sets.append(f"title = ${idx}")
+        args.append(body["title"])
+        idx += 1
+
+    if "metadata" in body:
+        sets.append(f"metadata = ${idx}::jsonb")
+        args.append(json.dumps(body["metadata"]))
+        idx += 1
+
+    args.append(uid)
+    set_clause = ", ".join(sets)
+
+    updated = await fetch_one(
+        f"UPDATE sessions SET {set_clause} WHERE id = ${idx} RETURNING *",
+        *args,
+    )
+
+    return _row_to_session(updated)
+
+
+@router.delete("/{session_id}", response_model=SessionResponse)
+async def terminate_session(session_id: str, request: Request) -> SessionResponse:
+    """Terminate a session: set status to terminated, destroy container."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Update status to terminated
+    updated = await fetch_one(
+        """UPDATE sessions
+           SET status = 'terminated', updated_at = now()
+           WHERE id = $1
+           RETURNING *""",
+        uid,
+    )
+
+    # Cancel the orchestrator task if it's running
+    orchestrator_tasks = getattr(request.app.state, "orchestrator_tasks", {})
+    task = orchestrator_tasks.pop(session_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+    # Destroy the container
+    container_id = row["container_id"]
+    if container_id:
+        sandbox = request.app.state.sandbox
+        await sandbox.destroy(container_id)
+
+    return _row_to_session(updated)
+
+
+@router.post("/{session_id}/archive", response_model=SessionResponse)
+async def archive_session(session_id: str) -> SessionResponse:
+    """Archive a session: set archived_at. Reject if already archived."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    if row["archived_at"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "conflict", "message": f"Session {session_id} is already archived"},
+        )
+
+    updated = await fetch_one(
+        """UPDATE sessions
+           SET archived_at = now(), updated_at = now()
+           WHERE id = $1
+           RETURNING *""",
+        uid,
+    )
+
+    return _row_to_session(updated)
+
+
+# ---- POST /v1/sessions/{id}/events ----
+
+
+@router.get("/{session_id}/streaming")
+async def get_session_streaming(session_id: str):
+    """Get the in-flight streaming state for a session.
+
+    Returns the accumulated text so far if the model is currently generating,
+    or null if no active stream.
+    """
+    state = await get_stream(session_id)
+    return {"streaming": state}
+
+
+@router.get("/{session_id}/events", response_model=PaginatedEventsResponse)
+async def get_session_events(
+    session_id: str,
+    after_cursor: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> PaginatedEventsResponse:
+    """Get events for a session with cursor-based pagination."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    result = await get_events(session_id, after_cursor=after_cursor, limit=limit)
+    return result
+
+
+@router.post("/{session_id}/events", status_code=201, response_model=list[EventResponse])
+async def post_events(session_id: str, body: PostEventsRequest) -> list[EventResponse]:
+    """Post events to a session.
+
+    Validates event types (422 via Pydantic), checks session exists (404),
+    checks session is not archived (409), appends events, and triggers
+    LISTEN/NOTIFY on the session channel.
+
+    Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.5, 10.4
+    """
+    # Validate session_id is a valid UUID
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Check session exists
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Check session is not archived
+    if row["archived_at"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "conflict", "message": f"Session {session_id} is archived"},
+        )
+
+    # Append each event
+    created_events: list[EventResponse] = []
+    for ev in body.events:
+        event = await append_event(session_id, ev.type, ev.payload)
+        created_events.append(
+            EventResponse(
+                session_id=event.session_id,
+                cursor=event.cursor,
+                seq=event.seq,
+                type=event.type,
+                payload=event.payload,
+                processed_at=event.processed_at,
+            )
+        )
+
+    # Trigger LISTEN/NOTIFY — replace hyphens with underscores for PG channel name validity
+    channel = f"session_{session_id.replace('-', '_')}"
+    await notify(channel, "new_events")
+
+    return created_events
+
+
+# ---- GET /v1/sessions/{id}/stream ----
+
+
+@router.get("/{session_id}/stream")
+async def stream_session(session_id: str, cursor: str | None = Query(default=None)):
+    """SSE stream endpoint: replay existing events then live-stream new ones.
+
+    - Validates session exists (404 if not).
+    - If cursor provided, validates it (422 if invalid).
+    - Phase 1: Replay all events after the cursor (or from beginning).
+    - Phase 2: Subscribe to PG LISTEN/NOTIFY and yield new events as they arrive.
+    - On client disconnect, cleans up the LISTEN subscription.
+
+    Validates: Requirements 7.1, 7.2, 7.4
+    """
+    # Validate session_id is a valid UUID
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Check session exists
+    row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    # Validate cursor if provided
+    if cursor is not None:
+        try:
+            decode_cursor(cursor)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "validation_error", "message": f"Invalid cursor: {cursor}"},
+            )
+
+    async def event_generator():
+        last_cursor = cursor
+
+        # Phase 1: Replay existing events
+        events_page = await get_events(session_id, after_cursor=last_cursor, limit=1000)
+        for event in events_page.events:
+            data = json.dumps({
+                "session_id": event.session_id,
+                "type": event.type,
+                "cursor": event.cursor,
+                "seq": event.seq,
+                "payload": event.payload,
+                "processed_at": str(event.processed_at) if event.processed_at else None,
+            })
+            yield {"data": data}
+            last_cursor = event.cursor
+
+        # Phase 2: Live stream via LISTEN/NOTIFY
+        # Use a polling approach with LISTEN to avoid race conditions:
+        # After subscribing, immediately check for events that arrived
+        # between the end of Phase 1 and the LISTEN subscription.
+        channel = f"session_{session_id.replace('-', '_')}"
+
+        async for _payload in listen(channel):
+            # On each notification (or initial subscription), fetch new events
+            new_events = await get_events(session_id, after_cursor=last_cursor, limit=100)
+            for event in new_events.events:
+                data = json.dumps({
+                    "session_id": event.session_id,
+                    "type": event.type,
+                    "cursor": event.cursor,
+                    "seq": event.seq,
+                    "payload": event.payload,
+                    "processed_at": str(event.processed_at) if event.processed_at else None,
+                })
+                yield {"data": data}
+                last_cursor = event.cursor
+
+    return EventSourceResponse(event_generator())

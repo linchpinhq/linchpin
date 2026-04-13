@@ -1,0 +1,25 @@
+.environment-detail-view {
+  padding: var(--spacing-xl);
+}
+
+.environment-detail-header {
+  margin-bottom: var(--spacing-xl);
+}
+
+.environment-detail-header h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: var(--spacing-xs);
+}
+
+.environment-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+}
+
+.environment-detail-meta code {
+  font-size: 0.75rem;
+}

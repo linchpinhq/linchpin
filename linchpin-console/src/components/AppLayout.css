@@ -1,0 +1,66 @@
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.app-main {
+  flex: 1;
+  margin-left: 240px;
+  padding: var(--spacing-xl);
+  max-width: 100%;
+  transition: margin-left 0.2s ease;
+}
+
+/* Hamburger toggle button — hidden on wide viewports */
+.sidebar-toggle {
+  display: none;
+  position: fixed;
+  top: var(--spacing-md);
+  left: var(--spacing-md);
+  z-index: 200;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--color-text-primary);
+}
+
+/* Overlay behind sidebar on small screens */
+.sidebar-overlay {
+  display: none;
+}
+
+/* Responsive: below 1024px */
+@media (max-width: 1023px) {
+  .sidebar-toggle {
+    display: block;
+  }
+
+  .app-main {
+    margin-left: 0;
+    padding-top: calc(var(--spacing-xl) + 40px);
+  }
+
+  .app-layout .sidebar {
+    transform: translateX(-100%);
+  }
+
+  .app-layout.sidebar-open .sidebar {
+    transform: translateX(0);
+  }
+
+  .sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.3);
+    z-index: 99;
+  }
+
+  .app-layout.sidebar-open .sidebar-overlay {
+    display: block;
+  }
+}

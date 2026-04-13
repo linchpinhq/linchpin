@@ -1,0 +1,82 @@
+.tool-confirmation-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.tool-confirmation-header {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.tool-confirmation-name {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--color-primary);
+}
+
+.tool-confirmation-args {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.tool-confirmation-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+.tool-confirmation-approve {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #fff;
+  background-color: var(--color-status-running);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.tool-confirmation-approve:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.tool-confirmation-approve:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tool-confirmation-reject {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #fff;
+  background-color: var(--color-danger);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.tool-confirmation-reject:hover:not(:disabled) {
+  background-color: var(--color-danger-hover);
+}
+
+.tool-confirmation-reject:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tool-confirmation-error {
+  font-size: 0.75rem;
+  color: var(--color-danger);
+}
