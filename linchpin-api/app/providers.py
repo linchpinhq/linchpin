@@ -135,6 +135,31 @@ class ModelProviderProtocol(Protocol):
 OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 
+def _extract_openrouter_error(resp: httpx.Response) -> str:
+    """Return a human-readable error string from an OpenRouter error response.
+
+    OpenRouter returns ``{"error": {"message": "...", "code": ...}}`` on
+    failure. Falls back to the raw body if the JSON shape is unexpected.
+    """
+    try:
+        data = resp.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        return resp.text or resp.reason_phrase
+    except Exception:
+        return resp.text or resp.reason_phrase
+
+
+async def _read_stream_body(resp: httpx.Response) -> str:
+    """Read the body of a streaming response that hasn't been consumed yet."""
+    try:
+        await resp.aread()
+    except Exception:
+        return resp.reason_phrase
+    return _extract_openrouter_error(resp)
+
+
 def _convert_tools_to_openai(tools: list[dict]) -> list[dict]:
     """Convert Linchpin tool definitions to OpenAI function-calling format."""
     return [
@@ -250,19 +275,20 @@ class OpenRouterProvider:
                 )
                 if resp.status_code in (429, 500, 502, 503):
                     raise RetryableError(
-                        f"OpenRouter returned {resp.status_code}: {resp.text}"
+                        f"OpenRouter returned {resp.status_code}: "
+                        f"{_extract_openrouter_error(resp)}"
                     )
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    raise ProviderError(
+                        f"OpenRouter returned {resp.status_code}: "
+                        f"{_extract_openrouter_error(resp)}"
+                    )
                 return _parse_openrouter_response(resp.json())
-            except RetryableError:
+            except (RetryableError, ProviderError):
                 raise
             except httpx.ConnectError as exc:
                 raise RetryableError(str(exc)) from exc
-            except httpx.HTTPStatusError as exc:
-                raise ProviderError(str(exc)) from exc
             except Exception as exc:
-                if isinstance(exc, ProviderError):
-                    raise
                 raise ProviderError(str(exc)) from exc
 
         return await _retry_with_backoff(_call)
@@ -287,19 +313,23 @@ class OpenRouterProvider:
                 )
                 resp = await self._client.send(req, stream=True)
                 if resp.status_code in (429, 500, 502, 503):
+                    detail = await _read_stream_body(resp)
                     await resp.aclose()
-                    raise RetryableError(f"OpenRouter returned {resp.status_code}")
-                resp.raise_for_status()
+                    raise RetryableError(
+                        f"OpenRouter returned {resp.status_code}: {detail}"
+                    )
+                if resp.status_code >= 400:
+                    detail = await _read_stream_body(resp)
+                    await resp.aclose()
+                    raise ProviderError(
+                        f"OpenRouter returned {resp.status_code}: {detail}"
+                    )
                 return resp
-            except RetryableError:
+            except (RetryableError, ProviderError):
                 raise
             except httpx.ConnectError as exc:
                 raise RetryableError(str(exc)) from exc
-            except httpx.HTTPStatusError as exc:
-                raise ProviderError(str(exc)) from exc
             except Exception as exc:
-                if isinstance(exc, (ProviderError, RetryableError)):
-                    raise
                 raise ProviderError(str(exc)) from exc
 
         resp = await _retry_with_backoff(_open_stream)

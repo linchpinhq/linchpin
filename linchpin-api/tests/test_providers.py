@@ -358,6 +358,48 @@ class TestOpenRouterProviderSend:
         assert result.content[0].text == "ok"
         assert call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_404_surfaces_response_body_message(self):
+        """Non-retryable HTTP errors must include OpenRouter's error message."""
+        provider = OpenRouterProvider()
+
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.text = '{"error":{"message":"No endpoints found for foo/bar","code":404}}'
+        resp.reason_phrase = "Not Found"
+        resp.json.return_value = {
+            "error": {"message": "No endpoints found for foo/bar", "code": 404}
+        }
+        provider._client = MagicMock()
+        provider._client.post = AsyncMock(return_value=resp)
+
+        with pytest.raises(ProviderError, match="No endpoints found for foo/bar"):
+            await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config("foo/bar"),
+                api_key="sk-test",
+            )
+
+    @pytest.mark.asyncio
+    async def test_400_with_non_json_body_falls_back_to_text(self):
+        """Errors with non-JSON bodies should still surface useful detail."""
+        provider = OpenRouterProvider()
+
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.text = "Bad Request: bogus model"
+        resp.reason_phrase = "Bad Request"
+        resp.json.side_effect = ValueError("not json")
+        provider._client = MagicMock()
+        provider._client.post = AsyncMock(return_value=resp)
+
+        with pytest.raises(ProviderError, match="Bad Request: bogus model"):
+            await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config(),
+                api_key="sk-test",
+            )
+
 
 # ---------------------------------------------------------------------------
 # OllamaProvider.send
