@@ -2,228 +2,172 @@
 
 > **Status:** Archived. No further development. Superseded by a clean-room rewrite.
 
-Linchpin is an open standard and self-hostable runtime for **managed AI agents**. It lets you run a managed-agent system on your own infrastructure, against any model provider, without vendor lock-in.
+Linchpin is an open standard and self-hostable runtime for **managed AI agents**. Run a managed-agent system on your own infrastructure, against any model provider (Anthropic, OpenAI, Ollama), without vendor lock-in.
 
-The MVP delivers five core capabilities:
-
-1. **Agents** — versioned configurations (model, system prompt, tools, MCP servers, per-tool permissions)
-2. **Environments** — container templates with configurable networking
-3. **Sessions** — agent runs inside per-session Docker containers
-4. **Event streaming** — SSE with cursor-based replay and pagination
-5. **Tool execution** — built-in tools, MCP servers, and custom HTTP tools, all gated by policy
-
-Target deployment: a single VM via `docker-compose`.
-
-## Architecture
-
-```mermaid
-graph TB
-    Client[Client / SDK / Console]
-
-    subgraph Compose["docker-compose (single VM)"]
-        API[linchpin-api<br/>FastAPI · Python 3.12]
-        Connector[linchpin-connector<br/>Python 3.12]
-        Console[linchpin-console<br/>React + Vite]
-        PG[(Postgres 16)]
-
-        subgraph Sandboxes["Per-session containers"]
-            C1[Container 1]
-            C2[Container 2]
-        end
-    end
-
-    LLM[LLM Provider<br/>Anthropic · OpenAI · Ollama]
-    MCP[MCP servers<br/>stdio subprocesses]
-    Ext[Custom HTTP tools]
-
-    Client -->|HTTP + SSE| API
-    Console -->|HTTP + SSE| API
-    API -->|SQL · LISTEN/NOTIFY| PG
-    API -->|POST /tools/invoke| Connector
-    API -->|docker-py| C1
-    API -->|docker-py| C2
-    API -->|HTTP| LLM
-    Connector -->|stdio| MCP
-    Connector -->|HTTP| Ext
-```
-
-### Components
-
-| Service | Stack | Purpose |
-|---|---|---|
-| `linchpin-api` | FastAPI · asyncpg · docker-py | HTTP surface, orchestrator loop, sandbox manager, built-in tools, SSE streaming, credential vaults |
-| `linchpin-connector` | Python · httpx | MCP server lifecycle (stdio transport), custom HTTP tool invocation |
-| `linchpin-console` | React · Vite · TypeScript | Web UI served via nginx |
-| `postgres` | Postgres 16 | Persistent state, event log, `LISTEN/NOTIFY` fanout to orchestrators |
-
-### Session state machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> running: session created
-    running --> idle: model turn complete
-    idle --> running: user message
-    running --> running: tool call
-    idle --> terminated: user terminates
-    running --> terminated: user terminates
-    running --> failed: unrecoverable error
-    [*] --> rescheduling: process restart
-    rescheduling --> idle: recovery complete
-```
-
-### Orchestrator loop
-
-One async task per live session. It:
-
-1. Builds conversation context from the event log
-2. Calls the model provider
-3. Emits `agent.message` / `agent.thinking` / `agent.tool_use` events
-4. Evaluates the policy for each tool call:
-   - `always_allow` → execute → emit `agent.tool_result` → loop
-   - `always_ask` → emit `session.requires_action`, block on `LISTEN/NOTIFY` until a `user.tool_confirmation` arrives
-5. On `user.interrupt`, halts the turn and transitions to `idle`
-6. On unrecoverable error, emits `session.error` and transitions to `failed`
-7. On process restart, replays the event log for non-terminal sessions (`rescheduling` → `idle`)
+You define **agents** (model + system prompt + tools + permissions) and **environments** (container templates). You start a **session** and Linchpin spins up an isolated Docker container, drives the agent loop, and streams every message, tool call, and status change back to you over SSE.
 
 ## Quick start
 
-```bash
-# 1. Configure
-cp .env.example .env   # then edit LINCHPIN_API_KEY, ANTHROPIC_API_KEY / OPENAI_API_KEY, VAULT_ENCRYPTION_KEY
+Requires Docker + Docker Compose.
 
-# 2. Bring up the stack
+```bash
+git clone https://github.com/flowagent-sh/linchpin.git
+cd linchpin
+cp .env.example .env   # set LINCHPIN_API_KEY + your model provider key
 docker compose up --build
 ```
 
-Services:
-
 | URL | What |
 |---|---|
-| `http://localhost:8000` | linchpin-api |
-| `http://localhost:8001` | linchpin-connector (internal — no auth) |
-| `http://localhost:3000` | linchpin-console |
-| `localhost:5432` | Postgres |
+| `http://localhost:8000` | API |
+| `http://localhost:3000` | Web console |
+| `http://localhost:8001` | Connector (internal) |
 
-### Required environment variables
+### Environment variables
 
-| Variable | Notes |
-|---|---|
-| `LINCHPIN_API_KEY` | Bearer token for client → api auth |
-| `DATABASE_URL` | Set by compose; `postgresql://linchpin:linchpin@postgres:5432/linchpin` |
-| `CONNECTOR_URL` | Set by compose; `http://linchpin-connector:8001` |
-| `CORS_ALLOWED_ORIGINS` | Comma-separated origins for the API |
-| `ANTHROPIC_API_KEY` | Optional — required to use the Anthropic provider |
-| `OPENAI_API_KEY` | Optional — required to use the OpenAI provider |
-| `VAULT_ENCRYPTION_KEY` | Fernet key for the credential vault (32 url-safe base64 bytes) |
-| `VITE_API_URL` | Build-time API URL for the console |
-
-## HTTP API
-
-All endpoints are versioned under `/v1` and require `Authorization: Bearer $LINCHPIN_API_KEY`.
-
-| Method | Path | Purpose |
+| Variable | Required | Notes |
 |---|---|---|
-| `POST` | `/v1/agents` | Create agent |
-| `GET` | `/v1/agents` · `/v1/agents/{id}` | List / fetch agents |
-| `POST` | `/v1/environments` | Create environment |
-| `GET` | `/v1/environments` · `/v1/environments/{id}` | List / fetch environments |
-| `POST` | `/v1/sessions` | Create session (provisions a container, starts the orchestrator) |
-| `GET` | `/v1/sessions` · `/v1/sessions/{id}` | List / fetch sessions |
-| `DELETE` | `/v1/sessions/{id}` | Terminate session |
-| `POST` | `/v1/sessions/{id}/archive` | Archive session |
-| `POST` | `/v1/sessions/{id}/events` | Append a `user.*` event |
-| `GET` | `/v1/sessions/{id}/events` | Cursor-paginated event history |
-| `GET` | `/v1/sessions/{id}/stream` | SSE stream (supports `?cursor=` replay) |
-| `POST` | `/v1/vaults` · `/v1/vaults/{id}/credentials` | Credential vaults |
+| `LINCHPIN_API_KEY` | yes | Bearer token for the API |
+| `VAULT_ENCRYPTION_KEY` | yes | Fernet key (32 url-safe base64 bytes) for credential encryption |
+| `ANTHROPIC_API_KEY` | one of these | |
+| `OPENAI_API_KEY` | one of these | |
+| `CORS_ALLOWED_ORIGINS` | no | Defaults to `http://localhost:3000` |
 
-### Event taxonomy
+For Ollama, point an agent's `model.base_url` at your Ollama instance — no env var needed.
 
-- **User:** `user.message`, `user.interrupt`, `user.tool_confirmation`, `user.custom_tool_result`
-- **Agent:** `agent.message`, `agent.thinking`, `agent.tool_use`, `agent.tool_result`, `agent.mcp_tool_use`, `agent.mcp_tool_result`, `agent.custom_tool_use`
-- **Session:** `session.status_running`, `session.status_idle`, `session.status_rescheduled`, `session.status_terminated`, `session.error`, `session.requires_action`
+## Hello world
 
-## Tools
+All requests need `Authorization: Bearer $LINCHPIN_API_KEY`.
 
-### Built-in (executed inside the session container by `linchpin-api`)
+```bash
+# 1. Create an environment
+curl -sX POST http://localhost:8000/v1/environments \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"default","config":{"networking":{"type":"unrestricted"}}}'
 
-`bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch`, `web_search`
+# 2. Create an agent
+curl -sX POST http://localhost:8000/v1/agents \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "name": "coder",
+    "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514"},
+    "system": "You are a careful Python engineer.",
+    "tools": [
+      {"name": "bash",  "permission": "always_ask"},
+      {"name": "read",  "permission": "always_allow"},
+      {"name": "write", "permission": "always_ask"},
+      {"name": "edit",  "permission": "always_ask"},
+      {"name": "glob",  "permission": "always_allow"},
+      {"name": "grep",  "permission": "always_allow"}
+    ]
+  }'
 
-### MCP servers
+# 3. Start a session
+curl -sX POST http://localhost:8000/v1/sessions \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"agent_id":"<id>","environment_id":"<id>"}'
 
-Configured per agent with `command`, `args`, `env`. The connector spawns each as a stdio subprocess for the session's lifetime.
+# 4. Send a message
+curl -sX POST http://localhost:8000/v1/sessions/<id>/events \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"type":"user.message","payload":{"text":"List the files in /workspace"}}'
 
-### Custom HTTP tools
+# 5. Stream the response
+curl -N http://localhost:8000/v1/sessions/<id>/stream \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY"
+```
 
-Configured per agent with an `endpoint`. The connector forwards calls and returns the response payload to the orchestrator.
+When the agent calls a tool with `always_ask`, the stream emits `session.requires_action`. Approve with:
+
+```bash
+curl -sX POST http://localhost:8000/v1/sessions/<id>/events \
+  -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"type":"user.tool_confirmation","payload":{"tool_use_id":"...","approved":true}}'
+```
+
+Or use the web console at `http://localhost:3000`.
+
+## What you can do
+
+### Agents
+
+Versioned configs: model, system prompt, tools, MCP servers, per-tool permissions. Editing an agent bumps its version; existing sessions keep running against the version they were created with.
+
+### Built-in tools
+
+`bash` · `read` · `write` · `edit` · `glob` · `grep` · `web_fetch` · `web_search`
+
+All execute inside the session's container.
+
+### Custom tools
+
+Two ways to extend an agent's toolbox:
+
+- **MCP servers** — configure `command` / `args` / `env`; the connector runs each as a stdio subprocess.
+- **HTTP tools** — configure an `endpoint`; the connector POSTs the tool call and returns the response.
 
 ### Permissions
 
-Each tool entry on an agent has a `permission`:
+Each tool entry on an agent is either `always_allow` (execute immediately) or `always_ask` (block on `user.tool_confirmation`).
 
-- `always_allow` — execute immediately
-- `always_ask` — emit `session.requires_action`, wait for `user.tool_confirmation`
+### Sandboxing
 
-## Sandboxing
+Each session runs in its own container (Ubuntu 22.04 · Python 3.12 · Node 20 · git · curl · jq · ripgrep). Networking is per-environment:
 
-Each session gets its own container built from a base image (Ubuntu 22.04 · Python 3.12 · Node 20 · git · curl · jq · ripgrep). Networking is controlled by the Environment:
-
-| `networking.type` | Docker network |
+| `networking.type` | Behavior |
 |---|---|
-| `none` | `linchpin-none` (no egress) |
-| `unrestricted` | `linchpin-open` |
+| `none` | No outbound network |
+| `unrestricted` | Full outbound network |
 
-The API container needs the host Docker socket mounted (`/var/run/docker.sock`).
+### Credential vaults
 
-## Credential vaults
+Encrypted credential storage. Reference credentials by name from agent MCP server configs; they're decrypted and injected as env vars when the session starts.
 
-Encrypted (Fernet, AES-128-CBC + HMAC) credential storage scoped to a vault. Credentials are referenced by name from agent MCP server configs and resolved at session start. See [`linchpin-api/app/encryption.py`](linchpin-api/app/encryption.py) and the [`credential-vaults` spec](.kiro/specs/credential-vaults/).
+### Web console
 
-## Repository layout
+A React UI for browsing agents/environments/sessions and chatting with agents live.
 
-```
-linchpin/
-├── linchpin-api/          # FastAPI service
-│   ├── app/
-│   │   ├── main.py        # FastAPI app + lifespan
-│   │   ├── routes/        # agents, environments, sessions, vaults
-│   │   ├── orchestrator.py
-│   │   ├── sandbox.py     # Docker sandbox protocol
-│   │   ├── providers.py   # Anthropic / OpenAI / Ollama adapters
-│   │   ├── tools.py       # built-in tools
-│   │   ├── policy.py      # permission evaluator
-│   │   ├── streaming.py   # SSE
-│   │   ├── events.py      # event log + LISTEN/NOTIFY
-│   │   ├── credentials.py · encryption.py
-│   │   ├── db.py · models.py · migrations.py · auth.py
-│   ├── alembic/           # schema migrations
-│   └── tests/
-├── linchpin-connector/    # MCP + custom HTTP tool runner
-│   └── app/{main.py, mcp.py, http_tools.py}
-├── linchpin-console/      # React + Vite UI
-├── .kiro/specs/           # design / requirements / tasks docs per feature
-└── docker-compose.yml
-```
+## API reference
+
+All endpoints are under `/v1` and require bearer auth.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` `GET` | `/v1/agents` | Create / list agents |
+| `GET` | `/v1/agents/{id}` | Fetch agent |
+| `POST` `GET` | `/v1/environments` | Create / list environments |
+| `GET` | `/v1/environments/{id}` | Fetch environment |
+| `POST` `GET` | `/v1/sessions` | Create / list sessions |
+| `GET` `DELETE` | `/v1/sessions/{id}` | Fetch / terminate session |
+| `POST` | `/v1/sessions/{id}/archive` | Archive session |
+| `POST` `GET` | `/v1/sessions/{id}/events` | Send event / list events (cursor-paginated) |
+| `GET` | `/v1/sessions/{id}/stream` | SSE stream (supports `?cursor=` replay) |
+| `POST` `GET` | `/v1/vaults` | Create / list vaults |
+| `POST` `GET` | `/v1/vaults/{id}/credentials` | Manage credentials |
 
 ## Development
 
 ```bash
-# API
 cd linchpin-api
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 alembic upgrade head
 uvicorn app.main:app --reload
-
-# Tests
 pytest
 
-# Connector
 cd ../linchpin-connector
 uv pip install -e ".[dev]"
 pytest
+
+cd ../linchpin-console
+pnpm install && pnpm dev
 ```
 
-Specs for each feature live under `.kiro/specs/` (requirements · design · tasks).
+## How it works
+
+For the session state machine, orchestrator loop, event taxonomy, component breakdown, and repo layout, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Per-feature specs (requirements · design · tasks) live under [`.kiro/specs/`](.kiro/specs/).
 
 ## License
 
