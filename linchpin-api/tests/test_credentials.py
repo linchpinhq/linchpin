@@ -47,7 +47,7 @@ async def test_resolve_api_key_found(mock_fetch):
     mock_fetch.return_value = {"encrypted_secrets": encrypted}
 
     resolver = CredentialResolver()
-    result = await resolver.resolve_api_key([vault_id], "anthropic")
+    result = await resolver.resolve_api_key([vault_id], "openrouter")
 
     assert result == "sk-test-123"
     mock_fetch.assert_called_once()
@@ -60,7 +60,7 @@ async def test_resolve_api_key_not_found(mock_fetch):
     mock_fetch.return_value = None
 
     resolver = CredentialResolver()
-    result = await resolver.resolve_api_key([str(uuid.uuid4())], "anthropic")
+    result = await resolver.resolve_api_key([str(uuid.uuid4())], "openrouter")
 
     assert result is None
 
@@ -77,7 +77,7 @@ async def test_resolve_api_key_vault_ordering(mock_fetch):
     mock_fetch.side_effect = [None, {"encrypted_secrets": encrypted}]
 
     resolver = CredentialResolver()
-    result = await resolver.resolve_api_key([vault_1, vault_2], "openai")
+    result = await resolver.resolve_api_key([vault_1, vault_2], "openrouter")
 
     assert result == "from-vault-2"
     assert mock_fetch.call_count == 2
@@ -90,7 +90,7 @@ async def test_resolve_api_key_decryption_failure(mock_fetch):
     mock_fetch.return_value = {"encrypted_secrets": b"corrupted-ciphertext"}
 
     resolver = CredentialResolver()
-    result = await resolver.resolve_api_key([str(uuid.uuid4())], "anthropic")
+    result = await resolver.resolve_api_key([str(uuid.uuid4())], "openrouter")
 
     assert result is None
 
@@ -99,7 +99,7 @@ async def test_resolve_api_key_decryption_failure(mock_fetch):
 async def test_resolve_api_key_empty_vault_ids():
     """Returns None when vault_ids list is empty."""
     resolver = CredentialResolver()
-    result = await resolver.resolve_api_key([], "anthropic")
+    result = await resolver.resolve_api_key([], "openrouter")
     assert result is None
 
 

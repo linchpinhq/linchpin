@@ -4,7 +4,7 @@
 
 /** LLM provider configuration. */
 export interface ModelConfig {
-  provider: "anthropic" | "openai" | "ollama";
+  provider: "openrouter" | "ollama";
   id: string;
   base_url?: string;
 }
@@ -225,7 +225,7 @@ export interface PostEventsRequest {
 // ---------------------------------------------------------------------------
 
 export type CredentialType = "bearer_token" | "api_key" | "oauth";
-export type ProviderName = "anthropic" | "openai" | "ollama";
+export type ProviderName = "openrouter" | "ollama";
 
 /** Vault domain model. */
 export interface Vault {

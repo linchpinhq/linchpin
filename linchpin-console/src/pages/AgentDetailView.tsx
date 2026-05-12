@@ -19,7 +19,7 @@ export default function AgentDetailView() {
 
   // Editable field state
   const [editName, setEditName] = useState('');
-  const [editProvider, setEditProvider] = useState<ModelConfig['provider']>('anthropic');
+  const [editProvider, setEditProvider] = useState<ModelConfig['provider']>('openrouter');
   const [editModelId, setEditModelId] = useState('');
   const [editBaseUrl, setEditBaseUrl] = useState('');
   const [editSystem, setEditSystem] = useState('');
@@ -171,8 +171,7 @@ export default function AgentDetailView() {
                 onChange={(e) => setEditProvider(e.target.value as ModelConfig['provider'])}
                 data-testid="edit-provider-select"
               >
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI</option>
+                <option value="openrouter">OpenRouter</option>
                 <option value="ollama">Ollama</option>
               </select>
             </div>

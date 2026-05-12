@@ -39,7 +39,7 @@ def _agent_row(agent_id: str, *, version: int = 1):
         "id": uuid.UUID(agent_id),
         "name": "integration-agent",
         "version": version,
-        "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514", "base_url": None},
+        "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4", "base_url": None},
         "system": "You are a helpful assistant.",
         "tools": [],
         "mcp_servers": [],
@@ -163,7 +163,7 @@ class TestSessionLifecycle:
             "/v1/agents",
             json={
                 "name": "integration-agent",
-                "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514"},
+                "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4"},
                 "system": "You are a helpful assistant.",
             },
             headers=AUTH,
@@ -171,7 +171,7 @@ class TestSessionLifecycle:
         assert resp.status_code == 201
         created_agent = resp.json()
         assert created_agent["name"] == "integration-agent"
-        assert created_agent["model"]["provider"] == "anthropic"
+        assert created_agent["model"]["provider"] == "openrouter"
 
         # --- Step 2: Create environment ---
         mock_env_fetch.return_value = env
@@ -263,7 +263,7 @@ class TestSessionLifecycle:
             "/v1/agents",
             json={
                 "name": "agent-open",
-                "model": {"provider": "openai", "id": "gpt-4"},
+                "model": {"provider": "openrouter", "id": "openai/gpt-4"},
                 "system": "You are helpful.",
             },
             headers=AUTH,
@@ -368,7 +368,7 @@ class TestSessionLifecycle:
         client, _ = lifecycle_client
         sid = str(uuid.uuid4())
 
-        assert client.post("/v1/agents", json={"name": "x", "model": {"provider": "anthropic", "id": "m"}, "system": "s"}).status_code == 401
+        assert client.post("/v1/agents", json={"name": "x", "model": {"provider": "openrouter", "id": "m"}, "system": "s"}).status_code == 401
         assert client.post("/v1/environments", json={"name": "x", "config": {"networking": {"type": "none"}}}).status_code == 401
         assert client.post("/v1/sessions", json={"agent_id": sid, "environment_id": sid}).status_code == 401
         assert client.post(f"/v1/sessions/{sid}/events", json={"events": [{"type": "user.message", "payload": {}}]}).status_code == 401

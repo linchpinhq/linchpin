@@ -23,7 +23,7 @@ def _make_agent_row(*, agent_id: str | None = None):
         "id": uuid.UUID(agent_id) if agent_id else uuid.uuid4(),
         "name": "test-agent",
         "version": 1,
-        "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514", "base_url": None},
+        "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4", "base_url": None},
         "system": "You are helpful.",
         "tools": [],
         "mcp_servers": [],

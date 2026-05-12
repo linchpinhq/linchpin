@@ -22,7 +22,7 @@ export default function AgentCreateForm() {
 
   // Basic info
   const [name, setName] = useState('');
-  const [provider, setProvider] = useState<ModelConfig['provider']>('anthropic');
+  const [provider, setProvider] = useState<ModelConfig['provider']>('openrouter');
   const [modelId, setModelId] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -196,8 +196,7 @@ export default function AgentCreateForm() {
               value={provider}
               onChange={(e) => setProvider(e.target.value as ModelConfig['provider'])}
             >
-              <option value="anthropic">Anthropic</option>
-              <option value="openai">OpenAI</option>
+              <option value="openrouter">OpenRouter</option>
               <option value="ollama">Ollama</option>
             </select>
           </div>

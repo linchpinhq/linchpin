@@ -676,23 +676,27 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
             # 5. Build conversation context from event log
             messages = await build_context(session_id, agent)
 
-            # 6. Resolve API key from vaults (if session has vault_ids)
+            # 6. Resolve API key from vaults (if session has vault_ids).
+            # Sessions without vault_ids fall through to the env-var lookup
+            # below (and providers that don't need a key, like Ollama, may
+            # leave it as None).
+            env_var_map = {
+                "openrouter": "OPENROUTER_API_KEY",
+            }
+            env_var_name = env_var_map.get(agent.model.provider)
+            env_key = os.environ.get(env_var_name, "") if env_var_name else ""
+
             resolved_api_key: str | None = None
             vault_ids = session.get("vault_ids") or []
             if vault_ids:
                 resolver = CredentialResolver()
                 resolved_api_key = await resolver.resolve_api_key(vault_ids, agent.model.provider)
 
-                # Vault-bound session but no credential found — check env var fallback
+                # Vault-bound session but no credential found — try env fallback.
                 if resolved_api_key is None:
-                    env_var_map = {
-                        "anthropic": "ANTHROPIC_API_KEY",
-                        "openai": "OPENAI_API_KEY",
-                    }
-                    env_var_name = env_var_map.get(agent.model.provider)
-                    env_key = os.environ.get(env_var_name, "") if env_var_name else ""
-                    if not env_key and agent.model.provider != "ollama":
-                        # No key found anywhere — fail the session
+                    if env_key:
+                        resolved_api_key = env_key
+                    elif agent.model.provider != "ollama":
                         await append_event(session_id, "session.error", {
                             "error": f"No API key found for provider '{agent.model.provider}'. "
                                      f"Configure a vault credential or set the "
@@ -701,7 +705,9 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
                         })
                         await transition(session_id, "failed")
                         return
-            # When no vault_ids, the provider SDK handles auth via env vars (existing behavior)
+            else:
+                # No vault bound — fall back to env var so the provider has auth.
+                resolved_api_key = env_key or None
 
             # 7. Get model provider and stream
             provider = get_provider(agent.model)

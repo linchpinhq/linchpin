@@ -1,4 +1,4 @@
-"""Unit tests for model provider adapters.
+"""Unit tests for model provider adapters (OpenRouter + Ollama).
 
 Covers:
 - Each provider constructs correct API calls
@@ -9,24 +9,21 @@ Covers:
 
 from __future__ import annotations
 
-import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.models import ModelConfig
 from app.providers import (
-    AnthropicProvider,
     ContentBlock,
     ModelResponse,
     OllamaProvider,
-    OpenAIProvider,
+    OpenRouterProvider,
+    OPENROUTER_DEFAULT_BASE_URL,
     ProviderError,
     RetryableError,
-    _parse_anthropic_response,
     _parse_ollama_response,
-    _parse_openai_response,
+    _parse_openrouter_response,
     _retry_with_backoff,
     get_provider,
 )
@@ -36,95 +33,37 @@ from app.providers import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _anthropic_config() -> ModelConfig:
-    return ModelConfig(provider="anthropic", id="claude-sonnet-4-20250514")
-
-
-def _openai_config() -> ModelConfig:
-    return ModelConfig(provider="openai", id="gpt-4o")
+def _openrouter_config(model_id: str = "anthropic/claude-sonnet-4") -> ModelConfig:
+    return ModelConfig(provider="openrouter", id=model_id)
 
 
 def _ollama_config() -> ModelConfig:
     return ModelConfig(provider="ollama", id="llama3", base_url="http://localhost:11434")
 
 
+def _mock_post_response(status_code: int = 200, json_data: dict | None = None):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data or {}
+    resp.raise_for_status = MagicMock()
+    resp.text = ""
+    return resp
+
+
 # ---------------------------------------------------------------------------
-# Response parsing — Anthropic
+# Response parsing — OpenRouter
 # ---------------------------------------------------------------------------
 
 
-class TestParseAnthropicResponse:
+class TestParseOpenRouterResponse:
     def test_text_response(self):
-        resp = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="Hello!")],
-            stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=10, output_tokens=5),
-        )
-        result = _parse_anthropic_response(resp)
-        assert len(result.content) == 1
-        assert result.content[0].type == "text"
-        assert result.content[0].text == "Hello!"
-        assert result.stop_reason == "end_turn"
-        assert result.usage == {"input_tokens": 10, "output_tokens": 5}
-
-    def test_tool_use_response(self):
-        resp = SimpleNamespace(
-            content=[
-                SimpleNamespace(type="tool_use", id="tu_1", name="bash", input={"command": "ls"}),
+        data = {
+            "choices": [
+                {"message": {"content": "Hello!"}, "finish_reason": "stop"},
             ],
-            stop_reason="tool_use",
-            usage=SimpleNamespace(input_tokens=20, output_tokens=15),
-        )
-        result = _parse_anthropic_response(resp)
-        assert len(result.content) == 1
-        block = result.content[0]
-        assert block.type == "tool_use"
-        assert block.tool_use_id == "tu_1"
-        assert block.tool_name == "bash"
-        assert block.tool_input == {"command": "ls"}
-
-    def test_thinking_response(self):
-        resp = SimpleNamespace(
-            content=[SimpleNamespace(type="thinking", thinking="Let me think...")],
-            stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=5, output_tokens=3),
-        )
-        result = _parse_anthropic_response(resp)
-        assert len(result.content) == 1
-        assert result.content[0].type == "thinking"
-        assert result.content[0].text == "Let me think..."
-
-    def test_mixed_response(self):
-        resp = SimpleNamespace(
-            content=[
-                SimpleNamespace(type="thinking", thinking="Hmm"),
-                SimpleNamespace(type="text", text="Here's the answer"),
-                SimpleNamespace(type="tool_use", id="tu_2", name="read", input={"path": "/tmp/x"}),
-            ],
-            stop_reason="tool_use",
-            usage=SimpleNamespace(input_tokens=30, output_tokens=25),
-        )
-        result = _parse_anthropic_response(resp)
-        assert len(result.content) == 3
-        assert result.content[0].type == "thinking"
-        assert result.content[1].type == "text"
-        assert result.content[2].type == "tool_use"
-
-
-# ---------------------------------------------------------------------------
-# Response parsing — OpenAI
-# ---------------------------------------------------------------------------
-
-
-class TestParseOpenAIResponse:
-    def test_text_response(self):
-        msg = SimpleNamespace(content="Hello!", tool_calls=None)
-        choice = SimpleNamespace(message=msg, finish_reason="stop")
-        resp = SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-        result = _parse_openai_response(resp)
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        result = _parse_openrouter_response(data)
         assert len(result.content) == 1
         assert result.content[0].type == "text"
         assert result.content[0].text == "Hello!"
@@ -132,17 +71,27 @@ class TestParseOpenAIResponse:
         assert result.usage == {"input_tokens": 10, "output_tokens": 5}
 
     def test_tool_call_response(self):
-        tc = SimpleNamespace(
-            id="call_1",
-            function=SimpleNamespace(name="bash", arguments='{"command": "ls"}'),
-        )
-        msg = SimpleNamespace(content=None, tool_calls=[tc])
-        choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
-        resp = SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=15),
-        )
-        result = _parse_openai_response(resp)
+        data = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": '{"command": "ls"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 15},
+        }
+        result = _parse_openrouter_response(data)
         assert len(result.content) == 1
         block = result.content[0]
         assert block.type == "tool_use"
@@ -151,12 +100,33 @@ class TestParseOpenAIResponse:
         assert block.tool_input == {"command": "ls"}
         assert result.stop_reason == "tool_use"
 
+    def test_tool_call_with_non_string_arguments(self):
+        data = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "c",
+                                "function": {"name": "read", "arguments": {"path": "/x"}},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+        result = _parse_openrouter_response(data)
+        assert result.content[0].tool_input == {"path": "/x"}
+
     def test_no_usage(self):
-        msg = SimpleNamespace(content="Hi", tool_calls=None)
-        choice = SimpleNamespace(message=msg, finish_reason="stop")
-        resp = SimpleNamespace(choices=[choice], usage=None)
-        result = _parse_openai_response(resp)
+        data = {"choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}]}
+        result = _parse_openrouter_response(data)
         assert result.usage == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_no_choices(self):
+        result = _parse_openrouter_response({})
+        assert result.content == []
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +158,6 @@ class TestParseOllamaResponse:
             },
         }
         result = _parse_ollama_response(data)
-        # Empty content string produces a text block
-        assert result.content[0].type == "text" if data["message"]["content"] else True
         tool_blocks = [b for b in result.content if b.type == "tool_use"]
         assert len(tool_blocks) == 1
         assert tool_blocks[0].tool_name == "bash"
@@ -248,124 +216,78 @@ class TestRetryWithBackoff:
 
 
 # ---------------------------------------------------------------------------
-# AnthropicProvider.send
+# OpenRouterProvider.send
 # ---------------------------------------------------------------------------
 
 
-class TestAnthropicProviderSend:
+class TestOpenRouterProviderSend:
     @pytest.mark.asyncio
     async def test_sends_correct_params(self):
-        provider = AnthropicProvider()
-        mock_response = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="Hi")],
-            stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=5, output_tokens=3),
-        )
+        provider = OpenRouterProvider()
+        response_data = {
+            "choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+        }
+        mock_resp = _mock_post_response(200, response_data)
+
         provider._client = MagicMock()
-        provider._client.messages = MagicMock()
-        provider._client.messages.create = AsyncMock(return_value=mock_response)
+        provider._client.post = AsyncMock(return_value=mock_resp)
 
         messages = [{"role": "user", "content": "Hello"}]
-        config = _anthropic_config()
-        result = await provider.send(messages, config)
+        config = _openrouter_config()
+        result = await provider.send(messages, config, api_key="sk-test")
 
-        provider._client.messages.create.assert_called_once()
-        call_kwargs = provider._client.messages.create.call_args[1]
-        assert call_kwargs["model"] == "claude-sonnet-4-20250514"
-        assert call_kwargs["messages"] == messages
+        provider._client.post.assert_called_once()
+        call_args = provider._client.post.call_args
+        assert call_args[0][0] == f"{OPENROUTER_DEFAULT_BASE_URL}/chat/completions"
+        body = call_args[1]["json"]
+        assert body["model"] == "anthropic/claude-sonnet-4"
+        assert body["messages"] == messages
+        # Streaming flag should not be set for send()
+        assert "stream" not in body
+        headers = call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer sk-test"
+        assert headers["Content-Type"] == "application/json"
         assert result.content[0].text == "Hi"
+        assert result.usage == {"input_tokens": 5, "output_tokens": 3}
 
     @pytest.mark.asyncio
-    async def test_extracts_system_message(self):
-        provider = AnthropicProvider()
-        mock_response = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="Hi")],
-            stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    async def test_omits_authorization_without_api_key(self):
+        provider = OpenRouterProvider()
+        mock_resp = _mock_post_response(
+            200,
+            {"choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}]},
         )
         provider._client = MagicMock()
-        provider._client.messages = MagicMock()
-        provider._client.messages.create = AsyncMock(return_value=mock_response)
+        provider._client.post = AsyncMock(return_value=mock_resp)
 
-        messages = [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Hello"},
+        await provider.send([{"role": "user", "content": "x"}], _openrouter_config())
+
+        headers = provider._client.post.call_args[1]["headers"]
+        assert "Authorization" not in headers
+
+    @pytest.mark.asyncio
+    async def test_converts_tools_to_openai_format(self):
+        provider = OpenRouterProvider()
+        mock_resp = _mock_post_response(
+            200,
+            {"choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}]},
+        )
+        provider._client = MagicMock()
+        provider._client.post = AsyncMock(return_value=mock_resp)
+
+        tools = [
+            {"name": "bash", "description": "Run cmd", "input_schema": {"type": "object"}}
         ]
-        await provider.send(messages, _anthropic_config())
-
-        call_kwargs = provider._client.messages.create.call_args[1]
-        assert call_kwargs["system"] == "You are helpful"
-        assert call_kwargs["messages"] == [{"role": "user", "content": "Hello"}]
-
-    @pytest.mark.asyncio
-    async def test_passes_tools(self):
-        provider = AnthropicProvider()
-        mock_response = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="Hi")],
-            stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+        await provider.send(
+            [{"role": "user", "content": "Hi"}],
+            _openrouter_config(),
+            tools=tools,
+            api_key="sk-test",
         )
-        provider._client = MagicMock()
-        provider._client.messages = MagicMock()
-        provider._client.messages.create = AsyncMock(return_value=mock_response)
 
-        tools = [{"name": "bash", "description": "Run a command", "input_schema": {}}]
-        await provider.send([{"role": "user", "content": "Hi"}], _anthropic_config(), tools=tools)
-
-        call_kwargs = provider._client.messages.create.call_args[1]
-        assert call_kwargs["tools"] == tools
-
-
-# ---------------------------------------------------------------------------
-# OpenAIProvider.send
-# ---------------------------------------------------------------------------
-
-
-class TestOpenAIProviderSend:
-    @pytest.mark.asyncio
-    async def test_sends_correct_params(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        provider = OpenAIProvider()
-        msg = SimpleNamespace(content="Hi", tool_calls=None)
-        choice = SimpleNamespace(message=msg, finish_reason="stop")
-        mock_response = SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
-        )
-        provider._client = MagicMock()
-        provider._client.chat = MagicMock()
-        provider._client.chat.completions = MagicMock()
-        provider._client.chat.completions.create = AsyncMock(return_value=mock_response)
-
-        messages = [{"role": "user", "content": "Hello"}]
-        result = await provider.send(messages, _openai_config())
-
-        provider._client.chat.completions.create.assert_called_once()
-        call_kwargs = provider._client.chat.completions.create.call_args[1]
-        assert call_kwargs["model"] == "gpt-4o"
-        assert call_kwargs["messages"] == messages
-        assert result.content[0].text == "Hi"
-
-    @pytest.mark.asyncio
-    async def test_converts_tools_to_openai_format(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        provider = OpenAIProvider()
-        msg = SimpleNamespace(content="Hi", tool_calls=None)
-        choice = SimpleNamespace(message=msg, finish_reason="stop")
-        mock_response = SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
-        )
-        provider._client = MagicMock()
-        provider._client.chat = MagicMock()
-        provider._client.chat.completions = MagicMock()
-        provider._client.chat.completions.create = AsyncMock(return_value=mock_response)
-
-        tools = [{"name": "bash", "description": "Run cmd", "input_schema": {"type": "object"}}]
-        await provider.send([{"role": "user", "content": "Hi"}], _openai_config(), tools=tools)
-
-        call_kwargs = provider._client.chat.completions.create.call_args[1]
-        assert call_kwargs["tools"] == [
+        body = provider._client.post.call_args[1]["json"]
+        assert body["tools"] == [
             {
                 "type": "function",
                 "function": {
@@ -375,6 +297,108 @@ class TestOpenAIProviderSend:
                 },
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_retries_on_429(self):
+        provider = OpenRouterProvider()
+
+        call_count = 0
+
+        async def mock_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                resp = MagicMock()
+                resp.status_code = 429
+                resp.text = "rate limited"
+                return resp
+            return _mock_post_response(
+                200,
+                {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            )
+
+        provider._client = MagicMock()
+        provider._client.post = mock_post
+
+        with patch("app.providers.asyncio.sleep", new_callable=AsyncMock):
+            result = await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config(),
+                api_key="sk-test",
+            )
+        assert result.content[0].text == "ok"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retries_on_connection_error(self):
+        import httpx as _httpx
+
+        call_count = 0
+
+        async def mock_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise _httpx.ConnectError("connection refused")
+            return _mock_post_response(
+                200,
+                {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            )
+
+        provider = OpenRouterProvider()
+        provider._client = MagicMock()
+        provider._client.post = mock_post
+
+        with patch("app.providers.asyncio.sleep", new_callable=AsyncMock):
+            result = await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config(),
+                api_key="sk-test",
+            )
+        assert result.content[0].text == "ok"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_404_surfaces_response_body_message(self):
+        """Non-retryable HTTP errors must include OpenRouter's error message."""
+        provider = OpenRouterProvider()
+
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.text = '{"error":{"message":"No endpoints found for foo/bar","code":404}}'
+        resp.reason_phrase = "Not Found"
+        resp.json.return_value = {
+            "error": {"message": "No endpoints found for foo/bar", "code": 404}
+        }
+        provider._client = MagicMock()
+        provider._client.post = AsyncMock(return_value=resp)
+
+        with pytest.raises(ProviderError, match="No endpoints found for foo/bar"):
+            await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config("foo/bar"),
+                api_key="sk-test",
+            )
+
+    @pytest.mark.asyncio
+    async def test_400_with_non_json_body_falls_back_to_text(self):
+        """Errors with non-JSON bodies should still surface useful detail."""
+        provider = OpenRouterProvider()
+
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.text = "Bad Request: bogus model"
+        resp.reason_phrase = "Bad Request"
+        resp.json.side_effect = ValueError("not json")
+        provider._client = MagicMock()
+        provider._client.post = AsyncMock(return_value=resp)
+
+        with pytest.raises(ProviderError, match="Bad Request: bogus model"):
+            await provider.send(
+                [{"role": "user", "content": "Hi"}],
+                _openrouter_config(),
+                api_key="sk-test",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -391,10 +415,7 @@ class TestOllamaProviderSend:
             "prompt_eval_count": 5,
             "eval_count": 3,
         }
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = response_data
-        mock_resp.raise_for_status = MagicMock()
+        mock_resp = _mock_post_response(200, response_data)
 
         provider._client = MagicMock()
         provider._client.post = AsyncMock(return_value=mock_resp)
@@ -425,16 +446,11 @@ class TestOllamaProviderSend:
                 resp.status_code = 429
                 resp.text = "rate limited"
                 return resp
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.json.return_value = {"message": {"content": "ok"}}
-            resp.raise_for_status = MagicMock()
-            return resp
+            return _mock_post_response(200, {"message": {"content": "ok"}})
 
         provider._client = MagicMock()
         provider._client.post = mock_post
 
-        # Patch sleep to avoid waiting
         with patch("app.providers.asyncio.sleep", new_callable=AsyncMock):
             result = await provider.send(
                 [{"role": "user", "content": "Hi"}], _ollama_config()
@@ -453,11 +469,7 @@ class TestOllamaProviderSend:
             call_count += 1
             if call_count < 2:
                 raise _httpx.ConnectError("connection refused")
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.json.return_value = {"message": {"content": "ok"}}
-            resp.raise_for_status = MagicMock()
-            return resp
+            return _mock_post_response(200, {"message": {"content": "ok"}})
 
         provider = OllamaProvider(base_url="http://localhost:11434")
         provider._client = MagicMock()
@@ -477,16 +489,21 @@ class TestOllamaProviderSend:
 
 
 class TestGetProvider:
-    def test_returns_anthropic(self):
-        config = _anthropic_config()
+    def test_returns_openrouter(self):
+        config = _openrouter_config()
         provider = get_provider(config)
-        assert isinstance(provider, AnthropicProvider)
+        assert isinstance(provider, OpenRouterProvider)
+        assert provider._base_url == OPENROUTER_DEFAULT_BASE_URL
 
-    def test_returns_openai(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        config = _openai_config()
+    def test_openrouter_custom_base_url(self):
+        config = ModelConfig(
+            provider="openrouter",
+            id="anthropic/claude-sonnet-4",
+            base_url="https://example.com/v1",
+        )
         provider = get_provider(config)
-        assert isinstance(provider, OpenAIProvider)
+        assert isinstance(provider, OpenRouterProvider)
+        assert provider._base_url == "https://example.com/v1"
 
     def test_returns_ollama(self):
         config = _ollama_config()
@@ -500,7 +517,7 @@ class TestGetProvider:
         assert provider._base_url == "http://localhost:11434"
 
     def test_unknown_provider_raises(self):
-        # Use model_construct to bypass validation for testing
+        # Bypass pydantic validation to test the factory's own guard.
         config = ModelConfig.model_construct(provider="unknown", id="x")
         with pytest.raises(ValueError, match="Unknown provider: unknown"):
             get_provider(config)
