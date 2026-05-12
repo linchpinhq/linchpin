@@ -37,6 +37,11 @@ export default function Sidebar() {
   return (
     <aside className="sidebar" data-testid="sidebar">
       <div className="sidebar-header">
+        <svg className="sidebar-mark" viewBox="0 0 64 64" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="9" strokeLinecap="square">
+          <path d="M18 8 L18 48" />
+          <path d="M18 48 L40 48" />
+          <circle cx="46" cy="48" r="7" fill="currentColor" stroke="none" />
+        </svg>
         <span className="sidebar-logo">Linchpin</span>
       </div>
 
