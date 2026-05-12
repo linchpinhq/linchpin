@@ -2,6 +2,20 @@
 
 > Open-source, self-hostable runtime for managed AI agents. Apache-2.0.
 
+<p align="center">
+  <a href="https://linchpin.work"><img src=".assets/demo.gif" alt="Linchpin demo — docker compose up, create a session, stream events" width="800"></a>
+</p>
+
+<p align="center">
+  <a href="https://linchpin.work">Website</a>
+  ·
+  <a href="https://linchpin.work/architecture">Architecture</a>
+  ·
+  <a href="ARCHITECTURE.md">Internals</a>
+  ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
 Linchpin is an open standard and self-hostable runtime for **managed AI agents**. Run a managed-agent system on your own infrastructure with the widest possible model coverage — every cloud model via [OpenRouter](https://openrouter.ai) (Claude, GPT, Gemini, Llama, DeepSeek, Mistral, Qwen, …) plus local models via [Ollama](https://ollama.com) — without vendor lock-in.
 
 You define **agents** (model + system prompt + tools + permissions) and **environments** (container templates). You start a **session** and Linchpin spins up an isolated Docker container, drives the agent loop, and streams every message, tool call, and status change back to you over SSE.
