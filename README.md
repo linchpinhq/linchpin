@@ -1,6 +1,6 @@
 # Linchpin
 
-> **Status:** Archived. No further development. Superseded by a clean-room rewrite.
+> Open-source, self-hostable runtime for managed AI agents. Apache-2.0.
 
 Linchpin is an open standard and self-hostable runtime for **managed AI agents**. Run a managed-agent system on your own infrastructure with the widest possible model coverage — every cloud model via [OpenRouter](https://openrouter.ai) (Claude, GPT, Gemini, Llama, DeepSeek, Mistral, Qwen, …) plus local models via [Ollama](https://ollama.com) — without vendor lock-in.
 
