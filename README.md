@@ -171,4 +171,6 @@ Per-feature specs (requirements · design · tasks) live under [`.kiro/specs/`](
 
 ## License
 
-Not specified.
+[Apache-2.0](LICENSE). Copyright © 2026 Flow Agent Inc. and Linchpin contributors.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the developer certificate of origin (DCO) sign-off requirement.
