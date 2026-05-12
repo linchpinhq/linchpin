@@ -75,9 +75,9 @@ def is_valid_event_type(event_type: str) -> bool:
 class ModelConfig(BaseModel):
     """LLM provider configuration."""
 
-    provider: Literal["anthropic", "openai", "ollama"]
+    provider: Literal["openrouter", "ollama"]
     id: str
-    base_url: str | None = None  # Only for ollama
+    base_url: str | None = None  # Override default endpoint for openrouter or ollama
 
 
 class BuiltinToolItemConfig(BaseModel):
@@ -357,7 +357,7 @@ class PaginatedListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 CredentialType = Literal["bearer_token", "api_key", "oauth"]
-ProviderName = Literal["anthropic", "openai", "ollama"]
+ProviderName = Literal["openrouter", "ollama"]
 
 
 # ---------------------------------------------------------------------------

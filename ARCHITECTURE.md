@@ -24,7 +24,7 @@ graph TB
         end
     end
 
-    LLM[LLM Provider<br/>Anthropic · OpenAI · Ollama]
+    LLM[LLM Provider<br/>OpenRouter · Ollama]
     MCP[MCP servers<br/>stdio subprocesses]
     Ext[Custom HTTP tools]
 
@@ -54,7 +54,7 @@ graph TB
 - **api ↔ Postgres**: asyncpg for queries, `LISTEN/NOTIFY` to wake orchestrators when new events land.
 - **api ↔ connector**: internal HTTP (`POST /tools/invoke`), no auth — connector is not exposed outside the compose network.
 - **api ↔ Docker**: docker-py against the host socket (`/var/run/docker.sock` is mounted into the api container).
-- **api ↔ LLM**: HTTP via provider-specific adapters (Anthropic, OpenAI, Ollama).
+- **api ↔ LLM**: HTTP via provider-specific adapters. Two providers today: `openrouter` (cloud aggregator, OpenAI-compatible wire format) and `ollama` (local). Both use raw `httpx`; no upstream SDK dependency.
 - **connector ↔ MCP**: one stdio subprocess per MCP server per session.
 - **connector ↔ custom tools**: HTTP to user-configured endpoints.
 
@@ -181,7 +181,7 @@ linchpin/
 │   │   ├── routes/        # agents, environments, sessions, vaults
 │   │   ├── orchestrator.py
 │   │   ├── sandbox.py     # Docker sandbox protocol
-│   │   ├── providers.py   # Anthropic / OpenAI / Ollama adapters
+│   │   ├── providers.py   # OpenRouter / Ollama adapters
 │   │   ├── tools.py       # built-in tools
 │   │   ├── policy.py      # permission evaluator
 │   │   ├── streaming.py   # SSE

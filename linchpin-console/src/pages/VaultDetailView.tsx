@@ -18,7 +18,7 @@ export default function VaultDetailView() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [credType, setCredType] = useState<CredentialType>('bearer_token');
   const [mcpUrl, setMcpUrl] = useState('');
-  const [provider, setProvider] = useState<ProviderName>('anthropic');
+  const [provider, setProvider] = useState<ProviderName>('openrouter');
   const [tokenVal, setTokenVal] = useState('');
   const [apiKeyVal, setApiKeyVal] = useState('');
   const [accessTokenVal, setAccessTokenVal] = useState('');
@@ -57,7 +57,7 @@ export default function VaultDetailView() {
   const resetAddForm = () => {
     setCredType('bearer_token');
     setMcpUrl('');
-    setProvider('anthropic');
+    setProvider('openrouter');
     setTokenVal('');
     setApiKeyVal('');
     setAccessTokenVal('');
@@ -261,8 +261,7 @@ export default function VaultDetailView() {
                     onChange={e => setProvider(e.target.value as ProviderName)}
                     data-testid="cred-provider-select"
                   >
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
+                    <option value="openrouter">OpenRouter</option>
                     <option value="ollama">Ollama</option>
                   </select>
                 </div>

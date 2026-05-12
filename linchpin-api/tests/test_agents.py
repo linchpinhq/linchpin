@@ -32,7 +32,7 @@ def _make_agent_row(
         "id": uuid.UUID(agent_id) if agent_id else uuid.uuid4(),
         "name": name,
         "version": version,
-        "model": model or {"provider": "anthropic", "id": "claude-sonnet-4-20250514", "base_url": None},
+        "model": model or {"provider": "openrouter", "id": "anthropic/claude-sonnet-4", "base_url": None},
         "system": system,
         "tools": tools or [],
         "mcp_servers": mcp_servers or [],
@@ -42,7 +42,7 @@ def _make_agent_row(
 
 VALID_PAYLOAD = {
     "name": "my-agent",
-    "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514"},
+    "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4"},
     "system": "You are a helpful assistant.",
     "tools": [],
     "mcp_servers": [],
@@ -63,7 +63,7 @@ def test_create_agent_returns_201(mock_fetch, client):
     body = resp.json()
     assert body["name"] == "my-agent"
     assert body["version"] == 1
-    assert body["model"]["provider"] == "anthropic"
+    assert body["model"]["provider"] == "openrouter"
     assert "id" in body
     assert "created_at" in body
 
@@ -204,17 +204,18 @@ def test_update_agent_name_returns_200(mock_fetch, client):
 def test_update_agent_model_returns_200(mock_fetch, client):
     """Updating the model config returns 200."""
     aid = str(uuid.uuid4())
-    new_model = {"provider": "openai", "id": "gpt-4o", "base_url": None}
+    new_model = {"provider": "openrouter", "id": "openai/gpt-4o", "base_url": None}
     mock_fetch.return_value = _make_agent_row(agent_id=aid, model=new_model, version=2)
 
     resp = client.patch(
         f"/v1/agents/{aid}",
-        json={"model": {"provider": "openai", "id": "gpt-4o"}},
+        json={"model": {"provider": "openrouter", "id": "openai/gpt-4o"}},
         headers=AUTH,
     )
 
     assert resp.status_code == 200
-    assert resp.json()["model"]["provider"] == "openai"
+    assert resp.json()["model"]["provider"] == "openrouter"
+    assert resp.json()["model"]["id"] == "openai/gpt-4o"
 
 
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)

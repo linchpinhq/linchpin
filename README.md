@@ -2,7 +2,7 @@
 
 > **Status:** Archived. No further development. Superseded by a clean-room rewrite.
 
-Linchpin is an open standard and self-hostable runtime for **managed AI agents**. Run a managed-agent system on your own infrastructure, against any model provider (Anthropic, OpenAI, Ollama), without vendor lock-in.
+Linchpin is an open standard and self-hostable runtime for **managed AI agents**. Run a managed-agent system on your own infrastructure with the widest possible model coverage — every cloud model via [OpenRouter](https://openrouter.ai) (Claude, GPT, Gemini, Llama, DeepSeek, Mistral, Qwen, …) plus local models via [Ollama](https://ollama.com) — without vendor lock-in.
 
 You define **agents** (model + system prompt + tools + permissions) and **environments** (container templates). You start a **session** and Linchpin spins up an isolated Docker container, drives the agent loop, and streams every message, tool call, and status change back to you over SSE.
 
@@ -29,8 +29,7 @@ docker compose up --build
 |---|---|---|
 | `LINCHPIN_API_KEY` | yes | Bearer token for the API |
 | `VAULT_ENCRYPTION_KEY` | yes | Fernet key (32 url-safe base64 bytes) for credential encryption |
-| `ANTHROPIC_API_KEY` | one of these | |
-| `OPENAI_API_KEY` | one of these | |
+| `OPENROUTER_API_KEY` | for cloud models | Get one at https://openrouter.ai/keys |
 | `CORS_ALLOWED_ORIGINS` | no | Defaults to `http://localhost:3000` |
 
 For Ollama, point an agent's `model.base_url` at your Ollama instance — no env var needed.
@@ -50,7 +49,7 @@ curl -sX POST http://localhost:8000/v1/agents \
   -H "Authorization: Bearer $LINCHPIN_API_KEY" -H "Content-Type: application/json" \
   -d '{
     "name": "coder",
-    "model": {"provider": "anthropic", "id": "claude-sonnet-4-20250514"},
+    "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4"},
     "system": "You are a careful Python engineer.",
     "tools": [
       {"name": "bash",  "permission": "always_ask"},
@@ -92,6 +91,15 @@ Or use the web console at `http://localhost:3000`.
 ### Agents
 
 Versioned configs: model, system prompt, tools, MCP servers, per-tool permissions. Editing an agent bumps its version; existing sessions keep running against the version they were created with.
+
+### Models
+
+| Provider | Where it runs | What you get |
+|---|---|---|
+| `openrouter` | Cloud (via OpenRouter) | ~200 models — Claude, GPT, Gemini, Llama, DeepSeek, Mistral, Qwen, … |
+| `ollama` | Your machine | Whatever you've `ollama pull`'d locally |
+
+OpenRouter model ids use the upstream-provider prefix (`anthropic/claude-sonnet-4`, `openai/gpt-4o`, `google/gemini-2.5-pro`, `meta-llama/llama-3.1-405b`, …). For Ollama, pass the local model tag (`llama3`, `qwen2.5-coder`, …) and set `base_url` to your Ollama endpoint.
 
 ### Built-in tools
 

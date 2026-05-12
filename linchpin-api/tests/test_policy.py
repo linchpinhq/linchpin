@@ -20,7 +20,7 @@ def _make_agent(tools=None) -> Agent:
         id="agent-1",
         name="test-agent",
         version=1,
-        model=ModelConfig(provider="anthropic", id="claude-sonnet-4-20250514"),
+        model=ModelConfig(provider="openrouter", id="anthropic/claude-sonnet-4"),
         system="You are helpful.",
         tools=tools or [],
         mcp_servers=[],
