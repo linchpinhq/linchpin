@@ -480,3 +480,35 @@ class CredentialResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Files API (v0.2.0)
+# ---------------------------------------------------------------------------
+
+FileSource = Literal["upload", "deliverable"]
+FileScopeType = Literal["session"]
+
+
+class FileResponse(BaseModel):
+    """File resource returned by the API. Metadata only; bytes stream via /content."""
+
+    id: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    source: FileSource
+    downloadable: bool
+    scope_type: FileScopeType | None = None
+    scope_id: str | None = None
+    created_at: datetime
+    archived_at: datetime | None = None
+
+
+class PaginatedFilesResponse(BaseModel):
+    """Cursor-paginated file list."""
+
+    data: list[FileResponse]
+    next_cursor: str | None = None
+    has_more: bool = False
