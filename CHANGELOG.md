@@ -1,0 +1,39 @@
+# Changelog
+
+All notable changes to Linchpin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Linchpin follows the versioning + deprecation rules described in the project's Release Plan.
+
+## [Unreleased]
+
+## [0.1.0] - 2026-05-13
+
+First formal release — the launch baseline. Tags the post-launch contents of `main` so everything before this point is "pre-release" and everything after follows the documented versioning + deprecation rules.
+
+### Added
+
+- **Managed-agent runtime.** Agents (model + system prompt + tools + permissions), environments (sandbox templates), and sessions (per-session Docker container driving the agent loop).
+- **HTTP + SSE API** under `/v1`. Bearer-auth (`LINCHPIN_API_KEY`). Cursor-paginated event log; SSE stream with cursor replay.
+- **Model providers.** `openrouter` (~200 cloud models via OpenRouter — Claude, GPT, Gemini, Llama, DeepSeek, Mistral, Qwen, …) and `ollama` (local). Both adapters use raw `httpx`; no upstream SDK dependency.
+- **Built-in tools.** `bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch`, `web_search` — all executed inside the session's container.
+- **Extensibility.** MCP servers over stdio and HTTP tools, both invoked via `linchpin-connector`.
+- **Per-tool permissions.** `always_allow` or `always_ask` (blocks on `user.tool_confirmation`).
+- **Sandboxing.** Per-session Docker container (Ubuntu 22.04 · Python 3.12 · Node 20 · git · curl · jq · ripgrep). Networking is per-environment: `none` or `unrestricted`.
+- **Credential vaults.** Workspace-scoped encrypted credential store (Fernet, keyed off `VAULT_ENCRYPTION_KEY`). Credentials are referenced by name from agent MCP server configs and injected as env vars when the session starts.
+- **Web console** (`linchpin-console`). React + Vite UI for browsing agents/environments/sessions and chatting live.
+- **Legal.** Apache-2.0 license, `NOTICE`, and `CONTRIBUTING.md` with DCO sign-off requirement.
+- **Docs.** User-first `README.md`, internals split to `ARCHITECTURE.md`, per-feature specs under `.kiro/specs/`.
+
+### Stack
+
+FastAPI · React + Vite · Postgres 16 · Docker · `docker-compose.yml` for local dev.
+
+### Hosted
+
+Live at [linchpin.work](https://linchpin.work) on Vercel.
+
+### Notes
+
+- No `Linchpin-API-Version` request header yet. The wire surface is treated as v1; explicit per-request version negotiation arrives in a later release.
+- Backend (`pyproject.toml` × 2) and console (`package.json`) currently bump version strings independently. A release script that keeps them in lockstep is planned for the next release.
+
+[Unreleased]: https://github.com/linchpinhq/linchpin/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/linchpinhq/linchpin/releases/tag/v0.1.0
