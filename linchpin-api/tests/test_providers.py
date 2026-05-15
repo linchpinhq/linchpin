@@ -68,7 +68,7 @@ class TestParseOpenRouterResponse:
         assert result.content[0].type == "text"
         assert result.content[0].text == "Hello!"
         assert result.stop_reason == "end_turn"
-        assert result.usage == {"input_tokens": 10, "output_tokens": 5}
+        assert result.usage == {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
     def test_tool_call_response(self):
         data = {
@@ -122,11 +122,61 @@ class TestParseOpenRouterResponse:
     def test_no_usage(self):
         data = {"choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}]}
         result = _parse_openrouter_response(data)
-        assert result.usage == {"input_tokens": 0, "output_tokens": 0}
+        assert result.usage == {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
     def test_no_choices(self):
         result = _parse_openrouter_response({})
         assert result.content == []
+
+    # v0.2.0 item #10 — cache-token surfacing
+
+    def test_cache_read_tokens_from_prompt_tokens_details(self):
+        """OpenRouter / Anthropic puts cache-read tokens under
+        ``prompt_tokens_details.cached_tokens``."""
+        data = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 75},
+            },
+        }
+        result = _parse_openrouter_response(data)
+        assert result.usage == {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 75,
+        }
+
+    def test_cache_creation_tokens_top_level(self):
+        """Anthropic-via-OpenRouter reports cache_creation_input_tokens at the
+        top level of the usage object."""
+        data = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 80,
+                "completion_tokens": 10,
+                "cache_creation_input_tokens": 200,
+            },
+        }
+        result = _parse_openrouter_response(data)
+        assert result.usage["cache_creation_input_tokens"] == 200
+        assert result.usage["cache_read_input_tokens"] == 0
+
+    def test_cache_tokens_both_present(self):
+        data = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cache_creation_input_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 30},
+            },
+        }
+        result = _parse_openrouter_response(data)
+        assert result.usage["cache_creation_input_tokens"] == 50
+        assert result.usage["cache_read_input_tokens"] == 30
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +196,7 @@ class TestParseOllamaResponse:
         assert result.content[0].type == "text"
         assert result.content[0].text == "Hello!"
         assert result.stop_reason == "end_turn"
-        assert result.usage == {"input_tokens": 10, "output_tokens": 5}
+        assert result.usage == {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
     def test_tool_call_response(self):
         data = {
@@ -167,7 +217,7 @@ class TestParseOllamaResponse:
     def test_no_usage_fields(self):
         data = {"message": {"content": "Hi"}}
         result = _parse_ollama_response(data)
-        assert result.usage == {"input_tokens": 0, "output_tokens": 0}
+        assert result.usage == {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +299,7 @@ class TestOpenRouterProviderSend:
         assert headers["Authorization"] == "Bearer sk-test"
         assert headers["Content-Type"] == "application/json"
         assert result.content[0].text == "Hi"
-        assert result.usage == {"input_tokens": 5, "output_tokens": 3}
+        assert result.usage == {"input_tokens": 5, "output_tokens": 3, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
 
     @pytest.mark.asyncio
     async def test_omits_authorization_without_api_key(self):

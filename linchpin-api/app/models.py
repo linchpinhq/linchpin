@@ -182,10 +182,18 @@ class SessionStats(BaseModel):
 
 
 class SessionUsage(BaseModel):
-    """Token usage for a session."""
+    """Cumulative token usage for a session (v0.2.0 item #10).
+
+    Cache fields default to 0 so providers that don't report prompt-caching
+    metrics (Ollama, OpenAI Chat Completions today) yield sensible numbers
+    rather than nulls. Counters are monotonic for the session lifetime;
+    update_usage() in orchestrator.py increments all four atomically.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0  # v0.2.0 item #10
+    cache_read_input_tokens: int = 0      # v0.2.0 item #10
 
 
 class Session(BaseModel):

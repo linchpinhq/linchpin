@@ -96,24 +96,45 @@ async def transition(session_id: str, new_status: str) -> None:
 
 
 async def update_usage(session_id: str, usage: dict) -> None:
-    """Increment session token usage counters."""
+    """Increment session token usage counters (v0.2.0 item #10).
+
+    Accumulates four counters: prompt input/output and prompt-caching
+    create/read. Providers that don't report cache metrics (Ollama, the
+    OpenAI Chat Completions shape) leave those at 0, which is correct.
+
+    Defensive cast: existing v0.1 rows have a usage JSONB with only
+    `input_tokens` + `output_tokens` keys. ``COALESCE((usage->>'k')::int, 0)``
+    handles the missing-key case so the UPDATE doesn't error on rows
+    created before this migration. New sessions ship all four keys
+    pre-seeded (see ``routes/sessions.py:create_session``).
+    """
     uid = uuid.UUID(session_id)
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
+    cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0)
+    cache_read_input_tokens = usage.get("cache_read_input_tokens", 0)
     await fetch_one(
         """
         UPDATE sessions
         SET usage = jsonb_set(
-                jsonb_set(usage, '{input_tokens}',
-                    to_jsonb((usage->>'input_tokens')::int + $1)),
-                '{output_tokens}',
-                to_jsonb((usage->>'output_tokens')::int + $2)),
+                jsonb_set(
+                    jsonb_set(
+                        jsonb_set(usage, '{input_tokens}',
+                            to_jsonb(COALESCE((usage->>'input_tokens')::int, 0) + $1)),
+                        '{output_tokens}',
+                        to_jsonb(COALESCE((usage->>'output_tokens')::int, 0) + $2)),
+                    '{cache_creation_input_tokens}',
+                    to_jsonb(COALESCE((usage->>'cache_creation_input_tokens')::int, 0) + $3)),
+                '{cache_read_input_tokens}',
+                to_jsonb(COALESCE((usage->>'cache_read_input_tokens')::int, 0) + $4)),
             updated_at = now()
-        WHERE id = $3
+        WHERE id = $5
         RETURNING id
         """,
         input_tokens,
         output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
         uid,
     )
 
@@ -718,7 +739,7 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
             accumulated_text = ""
             content_blocks: list[ContentBlock] = []
             stop_reason: str | None = None
-            usage = {"input_tokens": 0, "output_tokens": 0}
+            usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
             deltas_emitted = False
 
             # Start in-memory stream for live delta delivery (no DB writes for deltas)

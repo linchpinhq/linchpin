@@ -69,7 +69,7 @@ def _make_session_row(
         "last_event_cursor": None,
         "ttl_seconds": None,
         "stats": {"total_events": 0, "tool_calls": 0, "model_turns": 0},
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         "vault_ids": vault_ids or [],
     }
 
