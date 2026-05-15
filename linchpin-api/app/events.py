@@ -8,6 +8,7 @@ Validates: Requirements 7.3, 8.1, 8.2, 8.3, 8.4
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import uuid
@@ -15,6 +16,48 @@ from datetime import datetime, timezone
 
 from app.db import fetch_all, fetch_one
 from app.models import Event, EventResponse, PaginatedEventsResponse
+
+
+# ---------------------------------------------------------------------------
+# Per-session append serialization
+# ---------------------------------------------------------------------------
+#
+# `append_event` computes `next_seq = MAX(seq)+1` and then INSERTs in two
+# separate awaits. Pre-PR5 the orchestrator was the sole writer per session,
+# so writes were naturally serial within a single asyncio task. PR5 adds a
+# second concurrent writer — the deliverables watcher task — for the same
+# `session_id`. The two tasks can interleave between the SELECT and the
+# INSERT, both compute the same next_seq, and the loser raises
+# `UniqueViolationError` against the events `PRIMARY KEY (session_id, seq)`.
+#
+# A per-session `asyncio.Lock` serializes the SELECT+INSERT pair so writers
+# in this process see a monotonic seq. Single-process correctness only —
+# if the api ever runs multiple workers per pool, this needs to move to a
+# DB-side advisory lock or a `WITH ... INSERT ... ON CONFLICT RETURNING`
+# retry loop.
+
+_session_event_locks: dict[uuid.UUID, asyncio.Lock] = {}
+
+
+def _lock_for(session_id: uuid.UUID) -> asyncio.Lock:
+    lock = _session_event_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_event_locks[session_id] = lock
+    return lock
+
+
+def release_session_event_lock(session_id: str) -> None:
+    """Drop the per-session lock once the session is terminated.
+
+    Called from `terminate_session` so the dict doesn't grow unboundedly
+    across the api process's lifetime.
+    """
+    try:
+        sid = uuid.UUID(session_id)
+    except ValueError:
+        return
+    _session_event_locks.pop(sid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -55,71 +98,61 @@ async def append_event(
     """
     sid = uuid.UUID(session_id)
 
-    # Get next seq number
-    row = await fetch_one(
-        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM events WHERE session_id = $1",
-        sid,
-    )
-    next_seq: int = row["next_seq"]
-    cursor = encode_cursor(next_seq)
-
-    # Insert event
-    payload_json = json.dumps(payload)
-    event_row = await fetch_one(
-        """
-        INSERT INTO events (session_id, cursor, seq, type, payload)
-        VALUES ($1, $2, $3, $4, $5::jsonb)
-        RETURNING *
-        """,
-        sid,
-        cursor,
-        next_seq,
-        event_type,
-        payload_json,
-    )
-
-    # Update session stats and last_event_cursor
-    # Increment total_events; also increment tool_calls if it's a tool_use event,
-    # and model_turns if it's an agent.message event.
-    stats_update_parts = ["stats = jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1))"]
-    if event_type == "agent.tool_use":
-        stats_update_parts.append(
-            "stats = jsonb_set(stats, '{tool_calls}', to_jsonb((stats->>'tool_calls')::int + 1))"
+    async with _lock_for(sid):
+        # Get next seq number
+        row = await fetch_one(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM events WHERE session_id = $1",
+            sid,
         )
-    if event_type == "agent.message":
-        stats_update_parts.append(
-            "stats = jsonb_set(stats, '{model_turns}', to_jsonb((stats->>'model_turns')::int + 1))"
+        next_seq: int = row["next_seq"]
+        cursor = encode_cursor(next_seq)
+
+        # Insert event
+        payload_json = json.dumps(payload)
+        event_row = await fetch_one(
+            """
+            INSERT INTO events (session_id, cursor, seq, type, payload)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            RETURNING *
+            """,
+            sid,
+            cursor,
+            next_seq,
+            event_type,
+            payload_json,
         )
 
-    # Build a single UPDATE that chains the jsonb_set calls
-    # We need to nest them for multiple updates in one statement
-    if event_type == "agent.tool_use":
-        stats_expr = (
-            "jsonb_set("
-            "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1)), "
-            "'{tool_calls}', to_jsonb((stats->>'tool_calls')::int + 1))"
-        )
-    elif event_type == "agent.message":
-        stats_expr = (
-            "jsonb_set("
-            "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1)), "
-            "'{model_turns}', to_jsonb((stats->>'model_turns')::int + 1))"
-        )
-    else:
-        stats_expr = "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1))"
+        # Update session stats and last_event_cursor. Kept inside the lock so
+        # `last_event_cursor` advances monotonically with the seq we just
+        # inserted — otherwise a faster concurrent writer could overwrite it
+        # with an earlier cursor.
+        if event_type == "agent.tool_use":
+            stats_expr = (
+                "jsonb_set("
+                "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1)), "
+                "'{tool_calls}', to_jsonb((stats->>'tool_calls')::int + 1))"
+            )
+        elif event_type == "agent.message":
+            stats_expr = (
+                "jsonb_set("
+                "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1)), "
+                "'{model_turns}', to_jsonb((stats->>'model_turns')::int + 1))"
+            )
+        else:
+            stats_expr = "jsonb_set(stats, '{total_events}', to_jsonb((stats->>'total_events')::int + 1))"
 
-    await fetch_one(
-        f"""
-        UPDATE sessions
-        SET last_event_cursor = $1,
-            stats = {stats_expr},
-            updated_at = now()
-        WHERE id = $2
-        RETURNING id
-        """,
-        cursor,
-        sid,
-    )
+        await fetch_one(
+            f"""
+            UPDATE sessions
+            SET last_event_cursor = $1,
+                stats = {stats_expr},
+                updated_at = now()
+            WHERE id = $2
+            RETURNING id
+            """,
+            cursor,
+            sid,
+        )
 
     return Event(
         session_id=str(event_row["session_id"]),

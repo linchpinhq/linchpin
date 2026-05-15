@@ -14,6 +14,7 @@ route code.
 from __future__ import annotations
 
 import abc
+import asyncio
 import hashlib
 import logging
 import os
@@ -210,7 +211,19 @@ class LocalFileStore(FileStore):
         arbitrary host file — ``OSError(ELOOP)`` propagates and the watcher
         drops it. ``fstat``-driven size + regular-file check closes the
         TOCTOU window between the watcher's ``lstat`` and our open.
+
+        The whole pipeline (open, hash, copy) is sync stdlib I/O; with a
+        500 MiB per-file cap a single ingest can stall the event loop for
+        several seconds on SSD. Run it in the default thread pool so the
+        watcher coroutine yields control to other tasks.
         """
+        return await asyncio.to_thread(
+            self._write_from_path_sync, source_path, max_bytes,
+        )
+
+    def _write_from_path_sync(
+        self, source_path: str, max_bytes: int,
+    ) -> tuple[str, str, int]:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(source_path, flags)
         try:

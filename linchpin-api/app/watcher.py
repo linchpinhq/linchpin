@@ -232,7 +232,10 @@ async def _ingest_one(
         return 0
 
     try:
-        sha256 = _sha256_of_file(host_path)
+        # Hashing is stdlib sync I/O; with a 500 MiB per-file cap it can
+        # stall the event loop for seconds. Offload to the default thread
+        # pool so concurrent watcher tasks and HTTP requests keep running.
+        sha256 = await asyncio.to_thread(_sha256_of_file, host_path)
     except FileNotFoundError:
         return 0
     except OSError as exc:
@@ -340,6 +343,20 @@ def _guess_content_type(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def _collect_scan_paths(outputs_dir: Path) -> list[str]:
+    """Walk ``outputs_dir`` and return file paths in deterministic order.
+
+    Pulled out of ``_boot_scan`` so the walk itself (which on a busy session
+    can iterate thousands of inodes) doesn't block the event loop. The
+    caller runs this via ``asyncio.to_thread``.
+    """
+    out: list[str] = []
+    for root, _dirs, names in os.walk(outputs_dir):
+        for name in sorted(names):
+            out.append(os.path.join(root, name))
+    return out
+
+
 async def _boot_scan(session_id: str, outputs_dir: Path, *, store: FileStore) -> int:
     """Ingest anything already in ``outputs_dir`` on watcher start (D4).
 
@@ -350,17 +367,16 @@ async def _boot_scan(session_id: str, outputs_dir: Path, *, store: FileStore) ->
     aggregate_cap = get_per_session_cap_bytes()
     used = await _aggregate_used_bytes(session_id)
 
-    for root, _dirs, names in os.walk(outputs_dir):
-        for name in sorted(names):
-            host_path = os.path.join(root, name)
-            added = await _ingest_one(
-                session_id, host_path,
-                store=store,
-                per_file_cap=per_file_cap,
-                aggregate_cap=aggregate_cap,
-                used_so_far=used,
-            )
-            used += added
+    paths = await asyncio.to_thread(_collect_scan_paths, outputs_dir)
+    for host_path in paths:
+        added = await _ingest_one(
+            session_id, host_path,
+            store=store,
+            per_file_cap=per_file_cap,
+            aggregate_cap=aggregate_cap,
+            used_so_far=used,
+        )
+        used += added
     return used
 
 

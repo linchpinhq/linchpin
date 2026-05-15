@@ -429,6 +429,60 @@ def test_terminate_session(mock_fetch, mock_fetch_all, mock_execute, sandbox_cli
     )
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_terminate_session_removes_outputs_dir(
+    mock_fetch, mock_fetch_all, sandbox_client, tmp_path, monkeypatch,
+):
+    """Terminate wipes /mnt/session/outputs/<sid> on the host so the writable
+    bind doesn't leak up to LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES of
+    disk per session forever."""
+    client, _ = sandbox_client
+    outputs_root = tmp_path / "session-outputs"
+    monkeypatch.setenv("LINCHPIN_SESSION_OUTPUTS_ROOT", str(outputs_root))
+
+    sid = str(uuid.uuid4())
+    existing = _make_session_row(session_id=sid)
+    terminated = {**existing, "status": "terminated"}
+    mock_fetch.side_effect = [existing, terminated]
+    mock_fetch_all.return_value = []
+
+    # Pre-stage the per-session bind directory as if a watcher had been
+    # mirroring deliverables into it during the session's life.
+    session_dir = outputs_root / sid
+    session_dir.mkdir(parents=True)
+    (session_dir / "report.txt").write_bytes(b"agent deliverable")
+    (session_dir / "subdir").mkdir()
+    (session_dir / "subdir" / "nested.bin").write_bytes(b"\x00\x01\x02")
+    assert session_dir.exists()
+
+    resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert not session_dir.exists(), "outputs_dir should be removed on terminate"
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_terminate_session_outputs_dir_already_gone(
+    mock_fetch, mock_fetch_all, sandbox_client, tmp_path, monkeypatch,
+):
+    """Terminate is robust to the outputs directory never having been
+    created (e.g., a session that crashed before the watcher boot scan)."""
+    client, _ = sandbox_client
+    monkeypatch.setenv("LINCHPIN_SESSION_OUTPUTS_ROOT", str(tmp_path / "session-outputs"))
+
+    sid = str(uuid.uuid4())
+    existing = _make_session_row(session_id=sid)
+    terminated = {**existing, "status": "terminated"}
+    mock_fetch.side_effect = [existing, terminated]
+    mock_fetch_all.return_value = []
+
+    # No pre-stage — outputs dir does not exist.
+    resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
+    assert resp.status_code == 200
+
+
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
 def test_terminate_session_not_found(mock_fetch, sandbox_client):
     """Terminating a non-existent session returns 404."""

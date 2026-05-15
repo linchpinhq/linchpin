@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -24,12 +25,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
 from app.db import fetch_all, fetch_one, execute, listen, notify
-from app.events import append_event, decode_cursor, get_events
+from app.events import append_event, decode_cursor, get_events, release_session_event_lock
 from app.files import get_file_store
 from app.orchestrator import run_session
 from app.sandbox import ResourceMount, SandboxError
 from app.streaming import get_stream
-from app.watcher import ensure_session_outputs_dir, watch_session_deliverables
+from app.watcher import ensure_session_outputs_dir, session_outputs_dir, watch_session_deliverables
 from app.models import (
     CreateSessionRequest,
     EventResponse,
@@ -689,11 +690,32 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
 
     # PR5 — cancel the deliverables watcher task. Boot scan on next start
     # (D4) picks up anything written between now and a future restart, so
-    # the cancel is safe even if there are in-flight deliverables.
+    # the cancel is safe even if there are in-flight deliverables. Await
+    # the cancellation so the rmtree below doesn't race a still-running
+    # ingest (POSIX unlink-while-open is safe but we want the watcher's
+    # logs to finish before we wipe its directory).
     watcher_tasks = getattr(request.app.state, "watcher_tasks", {})
     watcher_task = watcher_tasks.pop(session_id, None)
     if watcher_task is not None and not watcher_task.done():
         watcher_task.cancel()
+        try:
+            await watcher_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # PR5 — terminal cleanup of the session's writable bind directory.
+    # During the session this directory is the agent's workspace (the
+    # source files are deliberately retained even after the watcher mirrors
+    # them into the FileStore). On terminate the workspace is dead state
+    # and would otherwise leak up to LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES
+    # per session permanently.
+    await asyncio.to_thread(
+        shutil.rmtree, str(session_outputs_dir(session_id)), True,
+    )
+
+    # Drop the per-session events.append lock so the dict doesn't grow
+    # unboundedly across the api process's lifetime.
+    release_session_event_lock(session_id)
 
     # Destroy the container
     container_id = row["container_id"]
