@@ -557,14 +557,31 @@ RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
 
 
 def _validate_mount_path(value: str) -> str:
-    """Shared mount_path rules: absolute, no traversal, not reserved."""
+    """Shared mount_path rules: absolute, no traversal, not reserved,
+    no double slashes; trailing slash stripped for canonical form.
+
+    Normalization protects the DB UNIQUE(session_id, mount_path) — without
+    it, `/mnt/data` and `/mnt/data/` would be distinct rows that mount the
+    same logical path in the sandbox.
+    """
     if not isinstance(value, str) or not value:
         raise ValueError("mount_path must be a non-empty string")
     if not value.startswith("/"):
         raise ValueError("mount_path must be absolute (start with '/')")
+    # Reject double slashes — they create ambiguous paths and Postgres treats
+    # `/a/b` and `/a//b` as distinct UNIQUE keys.
+    if "//" in value:
+        raise ValueError("mount_path must not contain consecutive slashes")
     # Reject any path segment equal to ".." — catches /a/../b, /../a, /a/..
     if any(seg == ".." for seg in value.split("/")):
         raise ValueError("mount_path must not contain '..' segments")
+    # Strip trailing slash for canonical form (but not from the root "/" — already
+    # rejected below as a reserved/empty mount).
+    if len(value) > 1 and value.endswith("/"):
+        value = value.rstrip("/")
+    # Reject the bare root — nothing legitimate mounts at "/".
+    if value == "/":
+        raise ValueError("mount_path must not be the filesystem root '/'")
     for prefix in RESERVED_MOUNT_PREFIXES:
         # Reserved prefix matches if mount_path is the prefix or sits beneath it.
         # Stripping trailing slash lets "/proc" match "/proc/foo" without matching "/procfs".

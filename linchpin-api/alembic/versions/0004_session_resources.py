@@ -25,8 +25,17 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     conn = op.get_bind()
 
+    # IF NOT EXISTS makes the upgrade idempotent — symmetric with downgrade's
+    # DROP IF EXISTS, and survives partial-failure replays.
+    #
+    # State-consistency CHECKs:
+    #   - state='failed' MUST have an error message (so /v1/sessions/{id}/resources
+    #     can surface the failure reason to the caller).
+    #   - state IN ('unmounted','failed') MUST have unmounted_at set (audit trail).
+    # These invariants will be set by PR3/PR4's state transition logic; we enforce
+    # them at the DB so a buggy state transition can't write inconsistent rows.
     conn.exec_driver_sql("""
-        CREATE TABLE session_resources (
+        CREATE TABLE IF NOT EXISTS session_resources (
             id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             session_id     UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
             type           TEXT NOT NULL CHECK (type IN ('file', 'memory_store', 'github_repository')),
@@ -37,12 +46,16 @@ def upgrade() -> None:
             error          TEXT,
             created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
             unmounted_at   TIMESTAMPTZ,
-            UNIQUE (session_id, mount_path)
+            UNIQUE (session_id, mount_path),
+            CONSTRAINT session_resources_failed_has_error
+                CHECK (state <> 'failed' OR error IS NOT NULL),
+            CONSTRAINT session_resources_terminal_has_unmounted_at
+                CHECK (state NOT IN ('unmounted', 'failed') OR unmounted_at IS NOT NULL)
         )
     """)
 
     conn.exec_driver_sql("""
-        CREATE INDEX session_resources_session_idx
+        CREATE INDEX IF NOT EXISTS session_resources_session_idx
             ON session_resources (session_id)
             WHERE state = 'mounted'
     """)

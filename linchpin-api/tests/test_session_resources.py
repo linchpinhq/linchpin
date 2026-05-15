@@ -233,6 +233,20 @@ class TestMountPathValidation:
                 mount_path="/proc/repo",
             )
 
+    def test_double_slash_rejected(self):
+        with pytest.raises(ValidationError, match="consecutive slashes"):
+            FileResource(type="file", file_id=str(uuid.uuid4()), mount_path="/mnt//data")
+
+    def test_trailing_slash_normalized(self):
+        # Trailing slash stripped so the DB UNIQUE(session_id, mount_path) sees
+        # /mnt/data and /mnt/data/ as the same logical mount.
+        r = FileResource(type="file", file_id=str(uuid.uuid4()), mount_path="/mnt/data/")
+        assert r.mount_path == "/mnt/data"
+
+    def test_root_path_rejected(self):
+        with pytest.raises(ValidationError, match="filesystem root"):
+            FileResource(type="file", file_id=str(uuid.uuid4()), mount_path="/")
+
 
 # ---------------------------------------------------------------------------
 # Within-request uniqueness
@@ -468,7 +482,9 @@ def test_memory_store_resource_returns_not_implemented(
         ],
     }
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
-    assert resp.status_code == 422
+    # 501 Not Implemented is the correct HTTP status — the request is well-
+    # formed; the server just doesn't implement this resource type yet.
+    assert resp.status_code == 501
     assert resp.json()["detail"]["error"] == "not_implemented"
 
 
@@ -499,7 +515,7 @@ def test_github_repository_resource_returns_not_implemented(
         ],
     }
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
-    assert resp.status_code == 422
+    assert resp.status_code == 501
     assert resp.json()["detail"]["error"] == "not_implemented"
 
 
@@ -556,3 +572,144 @@ def test_create_session_without_resources_returns_empty_list(
     assert resp.status_code == 201
     body = resp.json()
     assert body["resources"] == []
+
+
+# ---------------------------------------------------------------------------
+# Multi-resource persistence
+# ---------------------------------------------------------------------------
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_with_multiple_file_resources(mock_fetch_one, mock_fetch_all, sandbox_client):
+    """Multiple file resources all persist in order."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    file_a = str(uuid.uuid4())
+    file_b = str(uuid.uuid4())
+    sid = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_file_row(file_id=file_a),
+        _make_file_row(file_id=file_b),
+        _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(session_id=sid, mount_path="/mnt/data/a", config={"file_id": file_a}),
+        _make_resource_row(session_id=sid, mount_path="/mnt/data/b", config={"file_id": file_b}),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "file", "file_id": file_a, "mount_path": "/mnt/data/a"},
+            {"type": "file", "file_id": file_b, "mount_path": "/mnt/data/b"},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    paths = [r["mount_path"] for r in body["resources"]]
+    assert paths == ["/mnt/data/a", "/mnt/data/b"]
+
+
+# ---------------------------------------------------------------------------
+# List batch attribution — resources must not leak across sessions
+# ---------------------------------------------------------------------------
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+def test_list_sessions_attributes_resources_correctly(mock_fetch_all, sandbox_client):
+    """Each session in a list response gets only its own resources, not another
+    session's. Guards against a regression in the batch-attribution loop."""
+    client, _ = sandbox_client
+    sid_a = str(uuid.uuid4())
+    sid_b = str(uuid.uuid4())
+
+    session_a = _make_session_row(session_id=sid_a)
+    session_b = _make_session_row(session_id=sid_b)
+
+    # Three resources: two on A, one on B
+    res_a1 = _make_resource_row(session_id=sid_a, mount_path="/mnt/a1")
+    res_a2 = _make_resource_row(session_id=sid_a, mount_path="/mnt/a2")
+    res_b1 = _make_resource_row(session_id=sid_b, mount_path="/mnt/b1")
+
+    # fetch_all called twice: sessions list, then resources batch
+    mock_fetch_all.side_effect = [
+        [session_a, session_b],
+        [res_a1, res_a2, res_b1],
+    ]
+
+    resp = client.get("/v1/sessions", headers=AUTH)
+    assert resp.status_code == 200
+    sessions = {s["id"]: s for s in resp.json()["data"]}
+    assert sorted(r["mount_path"] for r in sessions[sid_a]["resources"]) == ["/mnt/a1", "/mnt/a2"]
+    assert [r["mount_path"] for r in sessions[sid_b]["resources"]] == ["/mnt/b1"]
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+def test_list_sessions_empty_skips_resource_query(mock_fetch_all, sandbox_client):
+    """When there are zero sessions, the resources batch query is skipped (the
+    `if session_ids:` guard). Asserting call_count == 1 prevents a regression
+    that drops the guard and fires a degenerate `WHERE session_id = ANY(ARRAY[])`."""
+    client, _ = sandbox_client
+    mock_fetch_all.side_effect = [[]]
+
+    resp = client.get("/v1/sessions", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["data"] == []
+    assert mock_fetch_all.call_count == 1, "resources query should be skipped on empty list"
+
+
+# ---------------------------------------------------------------------------
+# Hydration on update / terminate / archive (T10)
+# ---------------------------------------------------------------------------
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_update_session_hydrates_resources(mock_fetch_one, mock_fetch_all, sandbox_client):
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    existing = _make_session_row(session_id=sid)
+    updated = {**existing, "title": "New Title"}
+    mock_fetch_one.side_effect = [existing, updated]
+    mock_fetch_all.return_value = [_make_resource_row(session_id=sid, mount_path="/mnt/x")]
+
+    resp = client.post(f"/v1/sessions/{sid}", json={"title": "New Title"}, headers=AUTH)
+    assert resp.status_code == 200
+    assert [r["mount_path"] for r in resp.json()["resources"]] == ["/mnt/x"]
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_terminate_session_hydrates_resources(mock_fetch_one, mock_fetch_all, sandbox_client):
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    existing = _make_session_row(session_id=sid)
+    terminated = {**existing, "status": "terminated"}
+    mock_fetch_one.side_effect = [existing, terminated]
+    mock_fetch_all.return_value = [_make_resource_row(session_id=sid, mount_path="/mnt/x")]
+
+    resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
+    assert resp.status_code == 200
+    assert [r["mount_path"] for r in resp.json()["resources"]] == ["/mnt/x"]
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_archive_session_hydrates_resources(mock_fetch_one, mock_fetch_all, sandbox_client):
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    existing = _make_session_row(session_id=sid)
+    archived = {**existing, "archived_at": datetime(2025, 6, 1, tzinfo=timezone.utc)}
+    mock_fetch_one.side_effect = [existing, archived]
+    mock_fetch_all.return_value = [_make_resource_row(session_id=sid, mount_path="/mnt/x")]
+
+    resp = client.post(f"/v1/sessions/{sid}/archive", headers=AUTH)
+    assert resp.status_code == 200
+    assert [r["mount_path"] for r in resp.json()["resources"]] == ["/mnt/x"]

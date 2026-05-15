@@ -192,10 +192,17 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     # spec. File resources must reference an existing, unarchived upload (not a
     # deliverable — re-mounting deliverables across sessions would be a covert
     # channel; explicit re-upload is required).
+    #
+    # TOCTOU note: there is a deliberate gap between the file-existence check
+    # below and the session_resources INSERT further down — a file could be
+    # archived in between. PR2 accepts this race because the inserted row is a
+    # placeholder (state='mounted' is a lie until PR3 actually mounts). PR3
+    # MUST re-validate the file on mount and transition state='failed' with an
+    # error message if the file is no longer mountable.
     for resource in body.resources:
         if not isinstance(resource, FileResource):
             raise HTTPException(
-                status_code=422,
+                status_code=501,
                 detail={
                     "error": "not_implemented",
                     "message": (
@@ -294,8 +301,13 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     resources: list[SessionResource] = []
     for resource in body.resources:
         # FileResource is the only dispatchable type in v0.2; the route
-        # validator above rejects others before we get here.
-        assert isinstance(resource, FileResource)
+        # validator above rejects others before we get here. Explicit raise
+        # (not assert) so `python -O` doesn't strip the guard if a future
+        # refactor reorders the validation and persistence blocks.
+        if not isinstance(resource, FileResource):
+            raise RuntimeError(
+                f"unexpected resource type {type(resource).__name__} reached persist loop"
+            )
         config_json = json.dumps({"file_id": resource.file_id})
         resource_row = await fetch_one(
             """
