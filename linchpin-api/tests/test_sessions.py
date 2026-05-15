@@ -620,6 +620,62 @@ def test_post_events_requires_auth(sandbox_client):
     assert resp.status_code == 401
 
 
+# ---- v0.2.0 item #12: GET /events ?types[]= ----
+
+
+@patch("app.routes.sessions.get_events", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_get_events_passes_types_through(mock_fetch_one, mock_get_events, sandbox_client):
+    """?types[]= reaches get_events with a parallel list when types are valid."""
+    from app.models import PaginatedEventsResponse
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(sid)}
+    mock_get_events.return_value = PaginatedEventsResponse(events=[], next_cursor=None)
+
+    resp = client.get(
+        f"/v1/sessions/{sid}/events?types[]=agent.message&types[]=agent.tool_use",
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    mock_get_events.assert_awaited_once()
+    kwargs = mock_get_events.await_args.kwargs
+    assert kwargs["types"] == ["agent.message", "agent.tool_use"]
+
+
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_get_events_422_on_unknown_type(mock_fetch_one, sandbox_client):
+    """Unknown event type strings return 422 with the offender, not silent empty results."""
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(sid)}
+
+    resp = client.get(
+        f"/v1/sessions/{sid}/events?types[]=nope.not.real&types[]=agent.message",
+        headers=AUTH,
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_event_type"
+    assert detail["invalid"] == ["nope.not.real"]
+
+
+@patch("app.routes.sessions.get_events", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_get_events_no_types_param_unchanged(mock_fetch_one, mock_get_events, sandbox_client):
+    """Without types[], the route passes types=None through (existing behavior preserved)."""
+    from app.models import PaginatedEventsResponse
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(sid)}
+    mock_get_events.return_value = PaginatedEventsResponse(events=[], next_cursor=None)
+
+    resp = client.get(f"/v1/sessions/{sid}/events", headers=AUTH)
+    assert resp.status_code == 200
+    kwargs = mock_get_events.await_args.kwargs
+    assert kwargs["types"] is None
+
+
 # ---- Vault binding on session creation (Task 7.2) ----
 
 

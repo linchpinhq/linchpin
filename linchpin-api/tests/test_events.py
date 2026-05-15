@@ -268,3 +268,46 @@ class TestGetEvents:
 
         assert len(result.events) == 5
         assert result.next_cursor is None
+
+    # ---- v0.2.0 item #12 — types[] filter ----
+
+    @pytest.mark.asyncio
+    @patch("app.events.fetch_all", new_callable=AsyncMock)
+    async def test_get_events_types_filter_appears_in_sql(self, mock_fetch):
+        """Passing types= adds a `type = ANY($N)` clause to the SQL."""
+        sid = str(uuid.uuid4())
+        mock_fetch.return_value = []
+
+        await get_events(sid, after_cursor=None, limit=10, types=["agent.message"])
+        sql = mock_fetch.await_args.args[0]
+        assert "type = ANY" in sql
+        # The types list is passed positionally as the second arg (after sid).
+        positional = mock_fetch.await_args.args
+        assert positional[2] == ["agent.message"]
+
+    @pytest.mark.asyncio
+    @patch("app.events.fetch_all", new_callable=AsyncMock)
+    async def test_get_events_types_and_cursor_compose(self, mock_fetch):
+        """types= and after_cursor= both apply when both are present."""
+        sid = str(uuid.uuid4())
+        mock_fetch.return_value = []
+
+        await get_events(
+            sid,
+            after_cursor=encode_cursor(3),
+            limit=10,
+            types=["agent.message", "agent.tool_use"],
+        )
+        sql = mock_fetch.await_args.args[0]
+        assert "seq >" in sql and "type = ANY" in sql
+
+    @pytest.mark.asyncio
+    @patch("app.events.fetch_all", new_callable=AsyncMock)
+    async def test_get_events_empty_types_list_skips_filter(self, mock_fetch):
+        """An empty types=[] list is the same as no filter — no ANY clause."""
+        sid = str(uuid.uuid4())
+        mock_fetch.return_value = []
+
+        await get_events(sid, after_cursor=None, limit=10, types=[])
+        sql = mock_fetch.await_args.args[0]
+        assert "type = ANY" not in sql
