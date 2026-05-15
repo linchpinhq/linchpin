@@ -216,12 +216,14 @@ def test_create_session_missing_env_id_returns_422(sandbox_client):
 # ---- GET /v1/sessions/{id} ----
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_get_session_returns_200(mock_fetch, sandbox_client):
+def test_get_session_returns_200(mock_fetch, mock_fetch_all, sandbox_client):
     """Fetching an existing session returns 200 with full resource."""
     client, _ = sandbox_client
     sid = str(uuid.uuid4())
     mock_fetch.return_value = _make_session_row(session_id=sid)
+    mock_fetch_all.return_value = []
 
     resp = client.get(f"/v1/sessions/{sid}", headers=AUTH)
 
@@ -258,7 +260,11 @@ def test_get_session_invalid_uuid(sandbox_client):
 def test_list_sessions_returns_paginated(mock_fetch, sandbox_client):
     """Listing sessions returns a paginated response."""
     client, _ = sandbox_client
-    mock_fetch.return_value = [_make_session_row(), _make_session_row()]
+    # fetch_all is called twice: once for sessions, once for session_resources batch
+    mock_fetch.side_effect = [
+        [_make_session_row(), _make_session_row()],
+        [],
+    ]
 
     resp = client.get("/v1/sessions", headers=AUTH)
 
@@ -272,7 +278,10 @@ def test_list_sessions_returns_paginated(mock_fetch, sandbox_client):
 def test_list_sessions_has_more(mock_fetch, sandbox_client):
     """When more sessions exist than the limit, has_more is True."""
     client, _ = sandbox_client
-    mock_fetch.return_value = [_make_session_row() for _ in range(3)]
+    mock_fetch.side_effect = [
+        [_make_session_row() for _ in range(3)],
+        [],
+    ]
 
     resp = client.get("/v1/sessions?limit=2", headers=AUTH)
 
@@ -287,7 +296,10 @@ def test_list_sessions_filter_by_agent_id(mock_fetch, sandbox_client):
     """Listing sessions with agent_id filter passes it to the query."""
     client, _ = sandbox_client
     agent_id = str(uuid.uuid4())
-    mock_fetch.return_value = [_make_session_row(agent_id=agent_id)]
+    mock_fetch.side_effect = [
+        [_make_session_row(agent_id=agent_id)],
+        [],
+    ]
 
     resp = client.get(f"/v1/sessions?agent_id={agent_id}", headers=AUTH)
 
@@ -312,8 +324,9 @@ def test_list_sessions_empty(mock_fetch, sandbox_client):
 # ---- POST /v1/sessions/{id} (update) ----
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_update_session_title(mock_fetch, sandbox_client):
+def test_update_session_title(mock_fetch, mock_fetch_all, sandbox_client):
     """Updating session title returns updated resource."""
     client, _ = sandbox_client
     sid = str(uuid.uuid4())
@@ -321,6 +334,7 @@ def test_update_session_title(mock_fetch, sandbox_client):
     updated = {**existing, "title": "New Title"}
 
     mock_fetch.side_effect = [existing, updated]
+    mock_fetch_all.return_value = []
 
     resp = client.post(f"/v1/sessions/{sid}", json={"title": "New Title"}, headers=AUTH)
 
@@ -328,8 +342,9 @@ def test_update_session_title(mock_fetch, sandbox_client):
     assert resp.json()["title"] == "New Title"
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_update_session_metadata(mock_fetch, sandbox_client):
+def test_update_session_metadata(mock_fetch, mock_fetch_all, sandbox_client):
     """Updating session metadata returns updated resource."""
     client, _ = sandbox_client
     sid = str(uuid.uuid4())
@@ -338,6 +353,7 @@ def test_update_session_metadata(mock_fetch, sandbox_client):
     updated = {**existing, "metadata": new_meta}
 
     mock_fetch.side_effect = [existing, updated]
+    mock_fetch_all.return_value = []
 
     resp = client.post(f"/v1/sessions/{sid}", json={"metadata": new_meta}, headers=AUTH)
 
@@ -359,8 +375,9 @@ def test_update_session_not_found(mock_fetch, sandbox_client):
 # ---- DELETE /v1/sessions/{id} ----
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_terminate_session(mock_fetch, sandbox_client):
+def test_terminate_session(mock_fetch, mock_fetch_all, sandbox_client):
     """Terminating a session sets status to terminated and destroys container."""
     client, mock_sandbox = sandbox_client
     sid = str(uuid.uuid4())
@@ -368,6 +385,7 @@ def test_terminate_session(mock_fetch, sandbox_client):
     terminated = {**existing, "status": "terminated"}
 
     mock_fetch.side_effect = [existing, terminated]
+    mock_fetch_all.return_value = []
 
     resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
 
@@ -390,8 +408,9 @@ def test_terminate_session_not_found(mock_fetch, sandbox_client):
 # ---- POST /v1/sessions/{id}/archive ----
 
 
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_archive_session(mock_fetch, sandbox_client):
+def test_archive_session(mock_fetch, mock_fetch_all, sandbox_client):
     """Archiving a session sets archived_at."""
     client, _ = sandbox_client
     sid = str(uuid.uuid4())
@@ -399,6 +418,7 @@ def test_archive_session(mock_fetch, sandbox_client):
     archived = {**existing, "archived_at": datetime(2025, 6, 1, tzinfo=timezone.utc)}
 
     mock_fetch.side_effect = [existing, archived]
+    mock_fetch_all.return_value = []
 
     resp = client.post(f"/v1/sessions/{sid}/archive", headers=AUTH)
 
@@ -723,7 +743,10 @@ def test_get_session_includes_vault_ids(sandbox_client):
     vault_id = str(uuid.uuid4())
     session_row = _make_session_row(session_id=sid, vault_ids=[vault_id])
 
-    with patch("app.routes.sessions.fetch_one", new_callable=AsyncMock, return_value=session_row):
+    with (
+        patch("app.routes.sessions.fetch_one", new_callable=AsyncMock, return_value=session_row),
+        patch("app.routes.sessions.fetch_all", new_callable=AsyncMock, return_value=[]),
+    ):
         resp = client.get(f"/v1/sessions/{sid}", headers=AUTH)
 
     assert resp.status_code == 200

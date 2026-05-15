@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator, Field, Tag
+from pydantic import BaseModel, Discriminator, Field, Tag, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +207,7 @@ class Session(BaseModel):
     stats: SessionStats = Field(default_factory=SessionStats)
     usage: SessionUsage = Field(default_factory=SessionUsage)
     vault_ids: list[str] = Field(default_factory=list)
+    resources: list["SessionResource"] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +265,25 @@ class CreateSessionRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     ttl_seconds: int | None = None
     vault_ids: list[str] = Field(default_factory=list)
+    resources: list["SessionResourceConfig"] = Field(default_factory=list)
+
+    @field_validator("resources")
+    @classmethod
+    def _mount_paths_unique(cls, value: list[Any]) -> list[Any]:
+        # mount_path uniqueness within a single request — DB also enforces
+        # via UNIQUE(session_id, mount_path) but we want a clean 422 rather
+        # than a 500 from a duplicate-key error.
+        paths: list[str] = []
+        for resource in value:
+            mount_path = getattr(resource, "mount_path", None)
+            if mount_path is None:
+                continue  # memory_store has no mount_path
+            if mount_path in paths:
+                raise ValueError(
+                    f"duplicate mount_path '{mount_path}' in resources[]"
+                )
+            paths.append(mount_path)
+        return value
 
 
 class EventPayload(BaseModel):
@@ -324,6 +344,7 @@ class SessionResponse(BaseModel):
     stats: SessionStats = Field(default_factory=SessionStats)
     usage: SessionUsage = Field(default_factory=SessionUsage)
     vault_ids: list[str] = Field(default_factory=list)
+    resources: list["SessionResource"] = Field(default_factory=list)
 
 
 class EventResponse(BaseModel):
@@ -512,3 +533,125 @@ class PaginatedFilesResponse(BaseModel):
     data: list[FileResponse]
     next_cursor: str | None = None
     has_more: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Session Resources (v0.2.0 — Resources framework, item #1)
+# ---------------------------------------------------------------------------
+
+SessionResourceType = Literal["file", "memory_store", "github_repository"]
+SessionResourceState = Literal["mounted", "unmounting", "unmounted", "failed"]
+
+# Mount paths reserved by the platform — callers cannot mount resources here.
+# /mnt/session/outputs/ is owned by the deliverables watcher (v0.2 PR5).
+# /mnt/memory/ is reserved for v0.3 memory stores.
+# /proc, /sys, /dev, /etc/linchpin/ are kernel / platform namespaces.
+RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/mnt/session/outputs/",
+    "/mnt/memory/",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc/linchpin/",
+)
+
+
+def _validate_mount_path(value: str) -> str:
+    """Shared mount_path rules: absolute, no traversal, not reserved,
+    no double slashes; trailing slash stripped for canonical form.
+
+    Normalization protects the DB UNIQUE(session_id, mount_path) — without
+    it, `/mnt/data` and `/mnt/data/` would be distinct rows that mount the
+    same logical path in the sandbox.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("mount_path must be a non-empty string")
+    if not value.startswith("/"):
+        raise ValueError("mount_path must be absolute (start with '/')")
+    # Reject double slashes — they create ambiguous paths and Postgres treats
+    # `/a/b` and `/a//b` as distinct UNIQUE keys.
+    if "//" in value:
+        raise ValueError("mount_path must not contain consecutive slashes")
+    # Reject any path segment equal to ".." — catches /a/../b, /../a, /a/..
+    if any(seg == ".." for seg in value.split("/")):
+        raise ValueError("mount_path must not contain '..' segments")
+    # Strip trailing slash for canonical form (but not from the root "/" — already
+    # rejected below as a reserved/empty mount).
+    if len(value) > 1 and value.endswith("/"):
+        value = value.rstrip("/")
+    # Reject the bare root — nothing legitimate mounts at "/".
+    if value == "/":
+        raise ValueError("mount_path must not be the filesystem root '/'")
+    for prefix in RESERVED_MOUNT_PREFIXES:
+        # Reserved prefix matches if mount_path is the prefix or sits beneath it.
+        # Stripping trailing slash lets "/proc" match "/proc/foo" without matching "/procfs".
+        normalized = prefix.rstrip("/")
+        if value == normalized or value.startswith(normalized + "/"):
+            raise ValueError(f"mount_path '{value}' uses reserved prefix '{prefix}'")
+    return value
+
+
+class FileResource(BaseModel):
+    """Mount a previously-uploaded file into the sandbox read-only.
+
+    The referenced file must have source='upload' (deliverables cannot be
+    re-mounted into a different session — that would be a covert channel).
+    """
+
+    type: Literal["file"]
+    file_id: str
+    mount_path: str
+
+    @field_validator("mount_path")
+    @classmethod
+    def _validate_mount_path(cls, value: str) -> str:
+        return _validate_mount_path(value)
+
+
+class MemoryStoreResource(BaseModel):
+    """Attach a memory store. Reserved for v0.3 — rejected by v0.2 handlers."""
+
+    type: Literal["memory_store"]
+    memory_store_id: str
+    access: Literal["read_only", "read_write"] = "read_only"
+    instructions: str | None = None
+
+
+class GithubRepositoryResource(BaseModel):
+    """Clone a GitHub repo into the sandbox. Reserved for v0.5 — rejected by v0.2 handlers."""
+
+    type: Literal["github_repository"]
+    url: str
+    mount_path: str
+    authorization_token: str | None = None
+
+    @field_validator("mount_path")
+    @classmethod
+    def _validate_mount_path(cls, value: str) -> str:
+        return _validate_mount_path(value)
+
+
+SessionResourceConfig = Annotated[
+    Annotated[FileResource, Tag("file")]
+    | Annotated[MemoryStoreResource, Tag("memory_store")]
+    | Annotated[GithubRepositoryResource, Tag("github_repository")],
+    Discriminator("type"),
+]
+
+
+class SessionResource(BaseModel):
+    """Persisted session_resources row exposed via the API.
+
+    PR2 inserts these with ``state='mounted'`` at session-create time but
+    does not actually mount anything — sandbox machinery lands in PR3.
+    """
+
+    id: str
+    session_id: str
+    type: SessionResourceType
+    mount_path: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    state: SessionResourceState = "mounted"
+    error: str | None = None
+    created_at: datetime
+    unmounted_at: datetime | None = None

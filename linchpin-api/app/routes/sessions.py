@@ -29,9 +29,11 @@ from app.streaming import get_stream
 from app.models import (
     CreateSessionRequest,
     EventResponse,
+    FileResource,
     PaginatedEventsResponse,
     PaginatedListResponse,
     PostEventsRequest,
+    SessionResource,
     SessionResponse,
     SessionStats,
     SessionUsage,
@@ -42,7 +44,24 @@ logger = logging.getLogger("linchpin-api.sessions")
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
-def _row_to_session(row) -> SessionResponse:
+def _row_to_resource(row) -> SessionResource:
+    """Convert a session_resources asyncpg Record to a SessionResource."""
+    config_raw = row["config"]
+    config = json.loads(config_raw) if isinstance(config_raw, str) else config_raw
+    return SessionResource(
+        id=str(row["id"]),
+        session_id=str(row["session_id"]),
+        type=row["type"],
+        mount_path=row["mount_path"],
+        config=config,
+        state=row["state"],
+        error=row["error"],
+        created_at=row["created_at"],
+        unmounted_at=row["unmounted_at"],
+    )
+
+
+def _row_to_session(row, resources: list[SessionResource] | None = None) -> SessionResponse:
     """Convert an asyncpg Record to a SessionResponse."""
     stats_raw = row["stats"]
     usage_raw = row["usage"]
@@ -78,7 +97,19 @@ def _row_to_session(row) -> SessionResponse:
         stats=SessionStats(**stats),
         usage=SessionUsage(**usage),
         vault_ids=vault_ids,
+        resources=resources or [],
     )
+
+
+async def _load_session_resources(session_id: uuid.UUID) -> list[SessionResource]:
+    """Load all session_resources rows for a session (any state)."""
+    rows = await fetch_all(
+        """SELECT * FROM session_resources
+           WHERE session_id = $1
+           ORDER BY created_at ASC""",
+        session_id,
+    )
+    return [_row_to_resource(r) for r in rows]
 
 
 def _network_for_environment(config: dict) -> str:
@@ -156,6 +187,72 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                     },
                 )
 
+    # Validate resources[] — for v0.2 only type=file is dispatchable; the other
+    # types parse cleanly but are rejected here as not_implemented per the tech
+    # spec. File resources must reference an existing, unarchived upload (not a
+    # deliverable — re-mounting deliverables across sessions would be a covert
+    # channel; explicit re-upload is required).
+    #
+    # TOCTOU note: there is a deliberate gap between the file-existence check
+    # below and the session_resources INSERT further down — a file could be
+    # archived in between. PR2 accepts this race because the inserted row is a
+    # placeholder (state='mounted' is a lie until PR3 actually mounts). PR3
+    # MUST re-validate the file on mount and transition state='failed' with an
+    # error message if the file is no longer mountable.
+    for resource in body.resources:
+        if not isinstance(resource, FileResource):
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "error": "not_implemented",
+                    "message": (
+                        f"resource type '{resource.type}' is not supported in v0.2; "
+                        "only 'file' is dispatchable in this release"
+                    ),
+                },
+            )
+        try:
+            file_uid = uuid.UUID(resource.file_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"Invalid file id: {resource.file_id}",
+                },
+            )
+        file_row = await fetch_one(
+            "SELECT id, source, archived_at FROM files WHERE id = $1",
+            file_uid,
+        )
+        if file_row is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"File {resource.file_id} not found",
+                },
+            )
+        if file_row["archived_at"] is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"File {resource.file_id} is archived",
+                },
+            )
+        if file_row["source"] != "upload":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": (
+                        f"File {resource.file_id} has source='{file_row['source']}'; "
+                        "only uploads can be mounted as session resources"
+                    ),
+                },
+            )
+
     # Determine network from environment config
     env_config = env_row["config"]
     if isinstance(env_config, str):
@@ -197,6 +294,35 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         usage_json,
     )
 
+    # Persist session_resources rows. PR2 records state='mounted' as a
+    # placeholder — actual sandbox mounting lands in PR3. The DB enforces
+    # UNIQUE(session_id, mount_path); the Pydantic validator catches the
+    # same case earlier with a clean 422.
+    resources: list[SessionResource] = []
+    for resource in body.resources:
+        # FileResource is the only dispatchable type in v0.2; the route
+        # validator above rejects others before we get here. Explicit raise
+        # (not assert) so `python -O` doesn't strip the guard if a future
+        # refactor reorders the validation and persistence blocks.
+        if not isinstance(resource, FileResource):
+            raise RuntimeError(
+                f"unexpected resource type {type(resource).__name__} reached persist loop"
+            )
+        config_json = json.dumps({"file_id": resource.file_id})
+        resource_row = await fetch_one(
+            """
+            INSERT INTO session_resources
+                (session_id, type, mount_path, config, state)
+            VALUES ($1, $2, $3, $4::jsonb, 'mounted')
+            RETURNING *
+            """,
+            uuid.UUID(session_id),
+            resource.type,
+            resource.mount_path,
+            config_json,
+        )
+        resources.append(_row_to_resource(resource_row))
+
     # Start the orchestrator loop as a background async task
     task = asyncio.create_task(run_session(session_id, sandbox))
 
@@ -208,7 +334,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     task.add_done_callback(_task_done)
     request.app.state.orchestrator_tasks[session_id] = task
 
-    return _row_to_session(row)
+    return _row_to_session(row, resources=resources)
 
 
 @router.get("", response_model=PaginatedListResponse)
@@ -242,7 +368,21 @@ async def list_sessions(
 
     has_more = len(rows) > limit
     items = rows[:limit]
-    sessions = [_row_to_session(r) for r in items]
+
+    # Batch-load resources for all returned sessions in one query (avoids N+1).
+    session_ids = [r["id"] for r in items]
+    resources_by_session: dict[uuid.UUID, list[SessionResource]] = {sid: [] for sid in session_ids}
+    if session_ids:
+        resource_rows = await fetch_all(
+            """SELECT * FROM session_resources
+               WHERE session_id = ANY($1)
+               ORDER BY created_at ASC""",
+            session_ids,
+        )
+        for r in resource_rows:
+            resources_by_session.setdefault(r["session_id"], []).append(_row_to_resource(r))
+
+    sessions = [_row_to_session(r, resources=resources_by_session[r["id"]]) for r in items]
 
     return PaginatedListResponse(data=sessions, has_more=has_more, next_cursor=None)
 
@@ -264,7 +404,8 @@ async def get_session(session_id: str) -> SessionResponse:
             status_code=404,
             detail={"error": "not_found", "message": f"Session {session_id} not found"},
         )
-    return _row_to_session(row)
+    resources = await _load_session_resources(uid)
+    return _row_to_session(row, resources=resources)
 
 
 @router.post("/{session_id}", response_model=SessionResponse)
@@ -308,7 +449,8 @@ async def update_session(session_id: str, body: dict[str, Any]) -> SessionRespon
         *args,
     )
 
-    return _row_to_session(updated)
+    resources = await _load_session_resources(uid)
+    return _row_to_session(updated, resources=resources)
 
 
 @router.delete("/{session_id}", response_model=SessionResponse)
@@ -350,7 +492,8 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
         sandbox = request.app.state.sandbox
         await sandbox.destroy(container_id)
 
-    return _row_to_session(updated)
+    resources = await _load_session_resources(uid)
+    return _row_to_session(updated, resources=resources)
 
 
 @router.post("/{session_id}/archive", response_model=SessionResponse)
@@ -385,7 +528,8 @@ async def archive_session(session_id: str) -> SessionResponse:
         uid,
     )
 
-    return _row_to_session(updated)
+    resources = await _load_session_resources(uid)
+    return _row_to_session(updated, resources=resources)
 
 
 # ---- POST /v1/sessions/{id}/events ----
