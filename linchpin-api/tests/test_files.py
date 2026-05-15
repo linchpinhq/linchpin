@@ -356,9 +356,9 @@ def test_delete_file_removes_row_and_bytes_when_unreferenced(
     mock_fetch, mock_execute, mock_get_store, fake_store, client
 ):
     mock_get_store.return_value = fake_store
-    # First fetch_one: returns the target row. Second fetch_one: dedup check returns None.
+    # fetch_one order (PR3): target row → mount-conflict check (None) → dedup check (None).
     target = _make_file_row(storage_path="aa/bb/" + "aa" * 32)
-    mock_fetch.side_effect = [target, None]
+    mock_fetch.side_effect = [target, None, None]
 
     resp = client.delete(f"/v1/files/{uuid.uuid4()}", headers=AUTH)
 
@@ -376,14 +376,40 @@ def test_delete_file_preserves_bytes_when_storage_path_still_referenced(
     """If another row points at the same content-addressed bytes, don't drop them."""
     mock_get_store.return_value = fake_store
     target = _make_file_row(storage_path="cc/dd/" + "cc" * 32)
-    # Second fetch_one returns a sentinel row (some other file references same path).
-    mock_fetch.side_effect = [target, {"sentinel": True}]
+    # fetch_one order (PR3): target → mount check (None) → dedup check (sentinel row).
+    mock_fetch.side_effect = [target, None, {"sentinel": True}]
 
     resp = client.delete(f"/v1/files/{uuid.uuid4()}", headers=AUTH)
 
     assert resp.status_code == 204
     mock_execute.assert_awaited_once()
     fake_store.delete.assert_not_awaited()
+
+
+@patch("app.routes.files.execute", new_callable=AsyncMock)
+@patch("app.routes.files.fetch_one", new_callable=AsyncMock)
+def test_delete_file_returns_409_when_mounted(mock_fetch, mock_execute, client):
+    """PR3 — D10: DELETE 409s when the file is actively mounted into a session.
+    The error body identifies which session + mount_path so the caller can
+    terminate or unmount before retrying."""
+    target = _make_file_row(storage_path="ee/ff/" + "ee" * 32)
+    mounted_row = {
+        "id": uuid.uuid4(),
+        "session_id": uuid.uuid4(),
+        "mount_path": "/mnt/data/active.csv",
+    }
+    # fetch_one order: target row → mount check returns a row → no further calls.
+    mock_fetch.side_effect = [target, mounted_row]
+
+    resp = client.delete(f"/v1/files/{uuid.uuid4()}", headers=AUTH)
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "file_in_use"
+    assert detail["session_id"] == str(mounted_row["session_id"])
+    assert detail["mount_path"] == "/mnt/data/active.csv"
+    # No DELETE issued — file row + bytes preserved.
+    mock_execute.assert_not_awaited()
 
 
 @patch("app.routes.files.fetch_one", new_callable=AsyncMock)

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.sandbox import DockerSandbox, ExecResult, SandboxError
+from app.sandbox import DockerSandbox, ExecResult, ResourceMount, SandboxError
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,71 @@ class TestCreate:
             detach=True,
             stdin_open=True,
             tty=False,
+            volumes=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_create_with_mounts_passes_volumes(self):
+        """PR3 — mounts list should translate to docker-py ``volumes`` dict."""
+        client = _mock_client()
+        container = MagicMock()
+        container.id = "mnt123"
+        client.containers.run.return_value = container
+
+        mounts = [
+            ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/abcd", container_path="/mnt/data.csv"),
+            ResourceMount(host_path="/var/lib/linchpin/files/cc/dd/cdef", container_path="/mnt/extra/file.txt", mode="ro"),
+        ]
+        sandbox = DockerSandbox(client=client)
+        cid = await sandbox.create("img", "linchpin-none", mounts=mounts)
+
+        assert cid == "mnt123"
+        called_volumes = client.containers.run.call_args.kwargs["volumes"]
+        assert called_volumes == {
+            "/var/lib/linchpin/files/aa/bb/abcd": {"bind": "/mnt/data.csv", "mode": "ro"},
+            "/var/lib/linchpin/files/cc/dd/cdef": {"bind": "/mnt/extra/file.txt", "mode": "ro"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_with_empty_mounts_passes_none(self):
+        client = _mock_client()
+        container = MagicMock()
+        container.id = "x"
+        client.containers.run.return_value = container
+
+        sandbox = DockerSandbox(client=client)
+        await sandbox.create("img", "net", mounts=[])
+
+        # Empty list should normalize to None so docker-py treats the container
+        # as unmounted (matches v0.1 behavior pre-PR3).
+        assert client.containers.run.call_args.kwargs["volumes"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_absolute_host_path(self):
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="host_path must be absolute"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[ResourceMount(host_path="relative/path", container_path="/mnt/x")],
+            )
+        # No container.run call should have happened — validation fails before docker.
+        client.containers.run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_absolute_container_path(self):
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="container_path must be absolute"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[ResourceMount(host_path="/abs/path", container_path="relative")],
+            )
+        client.containers.run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_pulls_on_image_not_found(self):

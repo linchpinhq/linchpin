@@ -145,8 +145,9 @@ def test_create_session_unrestricted_network(mock_fetch, sandbox_client):
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
 
     assert resp.status_code == 201
-    # Verify sandbox.create was called with linchpin-open
-    mock_sandbox.create.assert_called_once_with("", "linchpin-open")
+    # Verify sandbox.create was called with linchpin-open (PR3 — empty mounts list
+    # is passed for no-resources requests).
+    mock_sandbox.create.assert_called_once_with("", "linchpin-open", mounts=[])
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
@@ -166,7 +167,7 @@ def test_create_session_none_network(mock_fetch, sandbox_client):
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
 
     assert resp.status_code == 201
-    mock_sandbox.create.assert_called_once_with("", "linchpin-none")
+    mock_sandbox.create.assert_called_once_with("", "linchpin-none", mounts=[])
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)

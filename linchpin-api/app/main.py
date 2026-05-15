@@ -18,6 +18,7 @@ from app.orchestrator import cleanup_expired_sessions, recover_sessions
 from app.routes.agents import router as agents_router
 from app.routes.environments import router as environments_router
 from app.routes.files import router as files_router
+from app.routes.session_resources import router as session_resources_router
 from app.routes.sessions import router as sessions_router
 from app.routes.vaults import router as vaults_router
 from app.sandbox import DockerSandbox, ensure_docker_networks
@@ -117,6 +118,7 @@ v1_router.include_router(agents_router)
 v1_router.include_router(environments_router)
 v1_router.include_router(files_router)
 v1_router.include_router(sessions_router)
+v1_router.include_router(session_resources_router)
 v1_router.include_router(vaults_router)
 
 app.include_router(v1_router)

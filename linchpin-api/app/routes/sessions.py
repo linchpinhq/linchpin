@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -24,7 +25,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.db import fetch_all, fetch_one, execute, listen, notify
 from app.events import append_event, decode_cursor, get_events
+from app.files import get_file_store
 from app.orchestrator import run_session
+from app.sandbox import ResourceMount, SandboxError
 from app.streaming import get_stream
 from app.models import (
     CreateSessionRequest,
@@ -193,12 +196,13 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     # deliverable — re-mounting deliverables across sessions would be a covert
     # channel; explicit re-upload is required).
     #
-    # TOCTOU note: there is a deliberate gap between the file-existence check
-    # below and the session_resources INSERT further down — a file could be
-    # archived in between. PR2 accepts this race because the inserted row is a
-    # placeholder (state='mounted' is a lie until PR3 actually mounts). PR3
-    # MUST re-validate the file on mount and transition state='failed' with an
-    # error message if the file is no longer mountable.
+    # PR3 closes PR2's TOCTOU note: the upfront validation block here checks
+    # existence + source + storage_path. The mount-time re-check below catches
+    # the narrow race between this block and container creation (file deleted
+    # between the two) and transitions the resource to state='failed' with a
+    # session.resource_mount_failed event — the spec's "session still starts"
+    # path.
+    file_meta: list[dict[str, Any]] = []  # parallel to body.resources
     for resource in body.resources:
         if not isinstance(resource, FileResource):
             raise HTTPException(
@@ -222,7 +226,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                 },
             )
         file_row = await fetch_one(
-            "SELECT id, source, archived_at FROM files WHERE id = $1",
+            "SELECT id, source, archived_at, storage_path FROM files WHERE id = $1",
             file_uid,
         )
         if file_row is None:
@@ -252,6 +256,10 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                     ),
                 },
             )
+        file_meta.append({
+            "file_uid": file_uid,
+            "storage_path": file_row["storage_path"],
+        })
 
     # Determine network from environment config
     env_config = env_row["config"]
@@ -259,10 +267,54 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         env_config = json.loads(env_config)
     network = _network_for_environment(env_config)
 
-    # Provision Docker container via sandbox
+    # Build the read-only mount list (D1 — plain `:ro` bind, no overlay2).
+    # Per-resource mount-time re-check catches files deleted between the
+    # upfront validation and now; failures get state='failed' rows and a
+    # session.resource_mount_failed event after the session row exists.
+    # FileStore is lazy-initialized only when there are resources to mount
+    # so v0.1-shape session creates (no resources) don't trigger a mkdir on
+    # LINCHPIN_FILES_ROOT (which defaults to /var/lib/linchpin and requires
+    # root permission outside production).
+    mounts: list[ResourceMount] = []
+    resource_states: list[tuple[str, str | None]] = []  # parallel to body.resources
+    file_store = get_file_store() if body.resources else None
+    for idx, resource in enumerate(body.resources):
+        assert isinstance(resource, FileResource)  # narrowed by the 501 raise above
+        assert file_store is not None  # narrowed by the if-guard above
+        meta = file_meta[idx]
+        host_path = file_store.absolute_path(meta["storage_path"])
+        if not os.path.isfile(host_path):
+            resource_states.append((
+                "failed",
+                (
+                    f"file {resource.file_id} backing path is missing on disk "
+                    f"(storage_path={meta['storage_path']!r})"
+                ),
+            ))
+            continue
+        mounts.append(ResourceMount(
+            host_path=host_path,
+            container_path=resource.mount_path,
+            mode="ro",
+        ))
+        resource_states.append(("mounted", None))
+
+    # Provision Docker container via sandbox with the read-only mounts.
     sandbox = request.app.state.sandbox
     image = ""  # empty string lets DockerSandbox use default/env var
-    container_id = await sandbox.create(image, network)
+    try:
+        container_id = await sandbox.create(image, network, mounts=mounts)
+    except SandboxError as exc:
+        # Container creation is all-or-nothing in docker-py — if it fails,
+        # there's no partial session to leave behind. Raise 500 with detail.
+        logger.error("sandbox.create failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "sandbox_create_failed",
+                "message": str(exc),
+            },
+        ) from exc
 
     # Insert session record
     session_id = str(uuid.uuid4())
@@ -300,34 +352,51 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         usage_json,
     )
 
-    # Persist session_resources rows. PR2 records state='mounted' as a
-    # placeholder — actual sandbox mounting lands in PR3. The DB enforces
-    # UNIQUE(session_id, mount_path); the Pydantic validator catches the
-    # same case earlier with a clean 422.
+    # Persist session_resources rows. State is 'mounted' for resources whose
+    # bind was added to the container; 'failed' (with error) for resources
+    # whose host_path went missing between validation and mount.
     resources: list[SessionResource] = []
-    for resource in body.resources:
-        # FileResource is the only dispatchable type in v0.2; the route
-        # validator above rejects others before we get here. Explicit raise
-        # (not assert) so `python -O` doesn't strip the guard if a future
-        # refactor reorders the validation and persistence blocks.
-        if not isinstance(resource, FileResource):
-            raise RuntimeError(
-                f"unexpected resource type {type(resource).__name__} reached persist loop"
-            )
+    failed_resources: list[tuple[uuid.UUID, str, str]] = []  # (resource_id, mount_path, error)
+    for idx, resource in enumerate(body.resources):
+        assert isinstance(resource, FileResource)
+        state, error = resource_states[idx]
         config_json = json.dumps({"file_id": resource.file_id})
         resource_row = await fetch_one(
             """
             INSERT INTO session_resources
-                (session_id, type, mount_path, config, state)
-            VALUES ($1, $2, $3, $4::jsonb, 'mounted')
+                (session_id, type, mount_path, config, state, error)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6)
             RETURNING *
             """,
             uuid.UUID(session_id),
             resource.type,
             resource.mount_path,
             config_json,
+            state,
+            error,
         )
         resources.append(_row_to_resource(resource_row))
+        if state == "failed":
+            failed_resources.append((resource_row["id"], resource.mount_path, error or ""))
+
+    # Emit session.resource_mount_failed events for any pre-mount failures.
+    # The session row is in place by this point so the events table's FK
+    # constraint (session_id REFERENCES sessions) is satisfied. Spec line
+    # 336: session still starts even when individual mounts fail.
+    for resource_uid, mount_path, error in failed_resources:
+        try:
+            await append_event(
+                session_id,
+                "session.resource_mount_failed",
+                {
+                    "resource_id": str(resource_uid),
+                    "mount_path": mount_path,
+                    "error": error,
+                },
+            )
+        except Exception:
+            # Best-effort: event log is not load-bearing for session boot.
+            logger.exception("failed to append session.resource_mount_failed event")
 
     # Start the orchestrator loop as a background async task
     task = asyncio.create_task(run_session(session_id, sandbox))

@@ -1,14 +1,15 @@
-"""Files API endpoints (v0.2.0 PR1).
+"""Files API endpoints (v0.2.0 PR1 + PR3).
 
 POST   /v1/files                       — Upload a file (multipart)
 GET    /v1/files                       — List files; ``?scope_id=`` filters by scope
 GET    /v1/files/{file_id}             — Get file metadata
 GET    /v1/files/{file_id}/content     — Stream file bytes (403 if not downloadable)
-DELETE /v1/files/{file_id}             — Hard delete (row + bytes)
+DELETE /v1/files/{file_id}             — Hard delete (row + bytes); 409 if mounted
 
-PR1 lands the user-facing surface. Deliverable ingestion (``source=deliverable``
-via an internal loopback route) and the active-mount conflict check on DELETE
-land in PR5 / PR4 respectively.
+PR1 shipped the user-facing surface and reference-counted dedup delete.
+PR3 added the active-mount 409 check (eng-review D10 — owned here after PR4
+was deferred to v0.2.x). Deliverable ingestion (``source=deliverable`` via
+the in-process watcher) lands in PR5.
 """
 
 from __future__ import annotations
@@ -228,9 +229,32 @@ async def delete_file(file_id: str):
             detail={"error": "not_found", "message": f"File {file_id} not found"},
         )
 
-    # PR4 will add a 409 check here for files mounted into an active session
-    # (against the session_resources table introduced in PR2). PR1 ships
-    # without it because that table does not yet exist.
+    # PR3 — D10: 409 if this file is currently mounted (or unmounting) into
+    # any active session. PR4 (live mount/unmount) was the original home for
+    # this check; with PR4 deferred to v0.2.x, PR3 owns it because PR3 is
+    # where session_resources actually starts representing real mounts.
+    mounted = await fetch_one(
+        """SELECT id, session_id, mount_path FROM session_resources
+           WHERE config->>'file_id' = $1
+             AND state IN ('mounted', 'unmounting')
+           LIMIT 1""",
+        str(file_uid),
+    )
+    if mounted is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "file_in_use",
+                "message": (
+                    f"File {file_id} is currently mounted in session "
+                    f"{mounted['session_id']} at {mounted['mount_path']!r}; "
+                    "terminate the session (which unmounts all its resources) "
+                    "before deleting the file."
+                ),
+                "session_id": str(mounted["session_id"]),
+                "mount_path": mounted["mount_path"],
+            },
+        )
 
     await execute("DELETE FROM files WHERE id = $1", file_uid)
 

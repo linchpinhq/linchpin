@@ -75,6 +75,17 @@ class FileStore(abc.ABC):
     async def delete(self, storage_path: str) -> None:
         """Remove the bytes at ``storage_path``. Idempotent."""
 
+    @abc.abstractmethod
+    def absolute_path(self, storage_path: str) -> str:
+        """Return the absolute host filesystem path for ``storage_path``.
+
+        Used by the sandbox to construct bind-mount sources. Backends that
+        don't expose a local path (future ``S3FileStore``) should raise
+        ``NotImplementedError`` here and rely on a fuse layer that mirrors
+        objects under a local prefix; the v0.2 sandbox does not handle
+        non-local file stores.
+        """
+
 
 class LocalFileStore(FileStore):
     """Local-filesystem backend rooted at ``LINCHPIN_FILES_ROOT``."""
@@ -135,6 +146,9 @@ class LocalFileStore(FileStore):
             full.unlink()
         except FileNotFoundError:
             return
+
+    def absolute_path(self, storage_path: str) -> str:
+        return str(self.root / storage_path)
 
 
 # ---------------------------------------------------------------------------

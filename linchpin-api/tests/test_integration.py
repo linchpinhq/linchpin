@@ -198,7 +198,7 @@ class TestSessionLifecycle:
         assert created_session["status"] == "running"
         assert created_session["agent_id"] == agent_id
         assert created_session["environment_id"] == env_id
-        mock_sandbox.create.assert_called_once_with("", "linchpin-none")
+        mock_sandbox.create.assert_called_once_with("", "linchpin-none", mounts=[])
 
         # --- Step 4: Send a user.message event ---
         mock_session_fetch.side_effect = None
@@ -287,7 +287,7 @@ class TestSessionLifecycle:
             headers=AUTH,
         )
         assert resp.status_code == 201
-        mock_sandbox.create.assert_called_with("", "linchpin-open")
+        mock_sandbox.create.assert_called_with("", "linchpin-open", mounts=[])
 
     @patch("app.routes.sessions.notify", new_callable=AsyncMock)
     @patch("app.routes.sessions.append_event", new_callable=AsyncMock)
