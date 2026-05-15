@@ -676,6 +676,27 @@ def test_get_events_no_types_param_unchanged(mock_fetch_one, mock_get_events, sa
     assert kwargs["types"] is None
 
 
+@patch("app.routes.sessions.get_events", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_get_events_empty_types_value_skips_filter(mock_fetch_one, mock_get_events, sandbox_client):
+    """`?types[]=` (no value) is treated as no filter, matching the documented contract.
+
+    Starlette parses an empty query value as `[""]`, not `None`. Without
+    handling, `""` would fail EVENT_TYPES validation and surface a confusing
+    422. Empty / whitespace-only entries are stripped to `None` instead.
+    """
+    from app.models import PaginatedEventsResponse
+    client, _ = sandbox_client
+    sid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(sid)}
+    mock_get_events.return_value = PaginatedEventsResponse(events=[], next_cursor=None)
+
+    resp = client.get(f"/v1/sessions/{sid}/events?types[]=", headers=AUTH)
+    assert resp.status_code == 200
+    kwargs = mock_get_events.await_args.kwargs
+    assert kwargs["types"] is None
+
+
 # ---- Vault binding on session creation (Task 7.2) ----
 
 

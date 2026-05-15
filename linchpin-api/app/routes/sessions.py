@@ -574,6 +574,14 @@ async def get_session_events(
             detail={"error": "not_found", "message": f"Session {session_id} not found"},
         )
 
+    # `?types[]=` (no value) is parsed by Starlette as [""], not None. Treat
+    # blank/whitespace entries as "no filter" so an empty query string behaves
+    # the same as omitting the param — the documented contract.
+    if types is not None:
+        types = [t for t in types if t and t.strip()]
+        if not types:
+            types = None
+
     # Validate every requested type against EVENT_TYPES so we return a
     # clean 422 with the offender, rather than a silent empty result set.
     if types:
