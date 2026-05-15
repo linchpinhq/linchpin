@@ -116,11 +116,15 @@ async def test_boot_scan_ingests_existing_files(tmp_path, fake_store, _mock_db, 
     _write(outputs / "a.txt", b"alpha")
     _write(outputs / "b.txt", b"beta")
 
-    # _aggregate_used_bytes returns 0, _already_ingested returns False
+    # _aggregate_used_bytes returns 0; _already_ingested returns False; the
+    # INSERT-with-RETURNING-id call returns a row (i.e. did insert, did not
+    # lose the dedup race).
     _mock_db["fetch_one"].side_effect = [
-        {"total": 0},  # _aggregate_used_bytes
-        None,          # _already_ingested(a)
-        None,          # _already_ingested(b)
+        {"total": 0},                 # _aggregate_used_bytes
+        None,                         # _already_ingested(a) → False
+        {"id": uuid.uuid4()},         # INSERT for a → inserted
+        None,                         # _already_ingested(b) → False
+        {"id": uuid.uuid4()},         # INSERT for b → inserted
     ]
 
     used = await watcher_mod._boot_scan("11111111-1111-1111-1111-111111111111", outputs, store=fake_store)
@@ -148,8 +152,9 @@ async def test_boot_scan_idempotent_via_sha256(tmp_path, fake_store, _mock_db, s
 
     # First scan: not ingested → register
     _mock_db["fetch_one"].side_effect = [
-        {"total": 0},  # aggregate
-        None,          # already_ingested(a) — False
+        {"total": 0},               # aggregate
+        None,                       # already_ingested(a) — False
+        {"id": uuid.uuid4()},       # INSERT-RETURNING id → row inserted
     ]
     await watcher_mod._boot_scan("11111111-1111-1111-1111-111111111110", outputs, store=fake_store)
     assert len(fake_store.written) == 1
@@ -233,6 +238,13 @@ async def test_ingest_emits_deliverable_event_and_inserts(tmp_path, fake_store, 
     outputs.mkdir()
     f = _write(outputs / "report.pdf", b"%PDF-1.4...")
 
+    # _already_ingested returns None (not ingested), then INSERT-RETURNING
+    # returns a row id (the dedup race winner is us).
+    _mock_db["fetch_one"].side_effect = [
+        None,                    # _already_ingested → False
+        {"id": uuid.uuid4()},    # INSERT RETURNING id → row inserted
+    ]
+
     added = await watcher_mod._ingest_one(
         "44444444-4444-4444-4444-444444444440", f,
         store=fake_store,
@@ -253,8 +265,38 @@ async def test_ingest_emits_deliverable_event_and_inserts(tmp_path, fake_store, 
     assert payload["filename"] == "report.pdf"
     assert payload["size_bytes"] == len(b"%PDF-1.4...")
     assert payload["content_type"] == "application/pdf"
-    # files INSERT issued.
-    _mock_db["execute"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_insert_conflict_skips_event(tmp_path, fake_store, _mock_db, small_caps):
+    """If the partial unique index (files_session_sha_uidx) fires — i.e. a
+    concurrent ingest already wrote this content for the session — the
+    INSERT RETURNING id yields no row, and we must NOT emit a duplicate
+    agent.deliverable event."""
+    outputs = tmp_path / "session-outputs"
+    outputs.mkdir()
+    f = _write(outputs / "race.txt", b"raced")
+
+    # _already_ingested returns None (we passed the application-level check),
+    # but the INSERT lost the race to a concurrent writer → RETURNING is
+    # empty → fetch_one returns None.
+    _mock_db["fetch_one"].side_effect = [
+        None,    # _already_ingested → False
+        None,    # INSERT RETURNING id → no row (dedup conflict)
+    ]
+
+    added = await watcher_mod._ingest_one(
+        "44444444-4444-4444-4444-444444444441", f,
+        store=fake_store,
+        per_file_cap=10_000,
+        aggregate_cap=100_000,
+        used_so_far=0,
+    )
+    # Lost the race — don't count it toward the aggregate.
+    assert added == 0
+    # The agent.deliverable event was already emitted by the race winner;
+    # we MUST NOT emit it again.
+    _mock_db["append_event"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -275,7 +317,6 @@ async def test_already_ingested_short_circuits(tmp_path, fake_store, _mock_db, s
     )
     assert added == 0
     assert fake_store.written == []
-    _mock_db["execute"].assert_not_awaited()
     _mock_db["append_event"].assert_not_awaited()
 
 
@@ -299,10 +340,13 @@ async def test_restart_recovery_ingests_exactly_once(tmp_path, fake_store, _mock
     _write(outputs / "2.txt", b"two")
     _write(outputs / "3.txt", b"three")
 
-    # Scan #1: aggregate 0 → 3 ingests
+    # Scan #1: aggregate 0 → 3 ingests. Each ingest now does TWO fetch_one
+    # calls: _already_ingested (None=False), then INSERT RETURNING id (row).
     _mock_db["fetch_one"].side_effect = [
-        {"total": 0},  # aggregate
-        None, None, None,  # already_ingested False x3
+        {"total": 0},               # aggregate
+        None, {"id": uuid.uuid4()}, # 1.txt: already=False, INSERT=row
+        None, {"id": uuid.uuid4()}, # 2.txt
+        None, {"id": uuid.uuid4()}, # 3.txt
     ]
     await watcher_mod._boot_scan("77777777-7777-7777-7777-777777777770", outputs, store=fake_store)
     assert len(fake_store.written) == 3
@@ -312,15 +356,16 @@ async def test_restart_recovery_ingests_exactly_once(tmp_path, fake_store, _mock
     _write(outputs / "5.txt", b"five")
 
     # Scan #2 (restart): aggregate seeded from DB to the bytes registered so far;
-    # already_ingested returns True for 1/2/3, False for 4/5.
+    # already_ingested returns True for 1/2/3 (short-circuit, no INSERT call),
+    # False for 4/5 (followed by an INSERT-RETURNING row).
     seen_bytes = sum(s for _, _, s in fake_store.written)
     _mock_db["fetch_one"].side_effect = [
-        {"total": seen_bytes},  # aggregate
-        {"already": True},      # 1.txt already ingested
-        {"already": True},      # 2.txt already ingested
-        {"already": True},      # 3.txt already ingested
-        None,                   # 4.txt new
-        None,                   # 5.txt new
+        {"total": seen_bytes},      # aggregate
+        {"already": True},          # 1.txt already ingested
+        {"already": True},          # 2.txt already ingested
+        {"already": True},          # 3.txt already ingested
+        None, {"id": uuid.uuid4()}, # 4.txt new
+        None, {"id": uuid.uuid4()}, # 5.txt new
     ]
     await watcher_mod._boot_scan("77777777-7777-7777-7777-777777777770", outputs, store=fake_store)
     assert len(fake_store.written) == 5, "all 5 registered exactly once across restart"
@@ -352,10 +397,15 @@ async def test_synthetic_workload_100_files(tmp_path, fake_store, _mock_db):
     for i, size in enumerate(sizes):
         _write(outputs / f"file-{i:03d}.bin", b"X" * size)
 
-    # All new — no dedup hits.
+    # All new — no dedup hits. Each ingest does TWO fetch_one calls:
+    # _already_ingested → None, then INSERT RETURNING id → row.
+    _insert_pairs: list = []
+    for _ in range(100):
+        _insert_pairs.append(None)               # _already_ingested → False
+        _insert_pairs.append({"id": uuid.uuid4()})  # INSERT RETURNING id
     _mock_db["fetch_one"].side_effect = [
         {"total": 0},
-        *[None] * 100,  # already_ingested = False for each
+        *_insert_pairs,
     ]
 
     started = time.monotonic()
@@ -410,3 +460,79 @@ async def test_watch_loop_stop_event_exits_cleanly(tmp_path, fake_store, _mock_d
         ),
         timeout=3.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Symlink rejection — host-file exfiltration guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_symlink_in_outputs_is_rejected(tmp_path, fake_store, _mock_db, small_caps):
+    """Regression: an agent that plants a symlink in the outputs bind cannot
+    use it to make the watcher hash/copy an arbitrary host file.
+
+    Without the lstat + O_NOFOLLOW guards, `_sha256_of_file` would follow the
+    symlink and `LocalFileStore.write_from_path` would copy the target into
+    the FileStore — turning the watcher into a host-file read primitive for
+    anything the api process can open.
+    """
+    secret = tmp_path / "host-only" / "passwd"
+    secret.parent.mkdir()
+    secret.write_bytes(b"root:x:0:0:host secret\n")
+
+    outputs = tmp_path / "session-outputs"
+    outputs.mkdir()
+    evil = outputs / "evil.txt"
+    os.symlink(secret, evil)
+
+    _mock_db["fetch_one"].return_value = {"total": 0}
+
+    added = await watcher_mod._ingest_one(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", str(evil),
+        store=fake_store,
+        per_file_cap=10_000,
+        aggregate_cap=100_000,
+        used_so_far=0,
+    )
+    assert added == 0
+    # Nothing ingested.
+    assert fake_store.written == []
+    # Symlink unlinked, but secret target untouched.
+    assert not os.path.lexists(evil), "symlink must be removed"
+    assert secret.exists(), "symlink target must NOT be touched"
+    assert secret.read_bytes() == b"root:x:0:0:host secret\n"
+    # agent.deliverable_dropped event with reason=symlink_rejected.
+    _mock_db["append_event"].assert_awaited_once()
+    args = _mock_db["append_event"].await_args_list[0].args
+    assert args[1] == "agent.deliverable_dropped"
+    assert args[2]["reason"] == "symlink_rejected"
+
+
+@pytest.mark.asyncio
+async def test_fifo_in_outputs_is_rejected(tmp_path, fake_store, _mock_db, small_caps):
+    """Non-regular files (fifos, sockets, devices) must also be rejected so
+    the watcher can't be blocked reading from a named pipe."""
+    outputs = tmp_path / "session-outputs"
+    outputs.mkdir()
+    fifo_path = outputs / "pipe"
+    try:
+        os.mkfifo(fifo_path)
+    except (AttributeError, OSError):
+        pytest.skip("platform does not support mkfifo")
+
+    _mock_db["fetch_one"].return_value = {"total": 0}
+
+    added = await watcher_mod._ingest_one(
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", str(fifo_path),
+        store=fake_store,
+        per_file_cap=10_000,
+        aggregate_cap=100_000,
+        used_so_far=0,
+    )
+    assert added == 0
+    assert fake_store.written == []
+    _mock_db["append_event"].assert_awaited_once()
+    args = _mock_db["append_event"].await_args_list[0].args
+    assert args[1] == "agent.deliverable_dropped"
+    assert args[2]["reason"] == "non_regular_file"

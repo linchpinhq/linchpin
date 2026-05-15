@@ -16,7 +16,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import httpx
 
@@ -965,14 +965,24 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
 async def recover_sessions(
     sandbox: DockerSandbox,
     orchestrator_tasks: dict[str, Any],
+    *,
+    watcher_tasks: dict[str, Any] | None = None,
+    spawn_watcher: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """Recover non-terminal sessions after process restart.
 
     1. Query for sessions with status in (running, idle, rescheduling).
     2. Set each to ``rescheduling``, emit ``session.status_rescheduled``.
     3. Check if the container still exists.
-    4. If container alive → transition to ``idle``, start orchestrator task.
+    4. If container alive → transition to ``idle``, start orchestrator task,
+       and (PR5 D4) re-spawn the deliverables watcher so its boot scan
+       ingests anything written during the outage.
     5. If container missing → transition to ``failed``, emit ``session.error``.
+
+    ``spawn_watcher`` is passed in (not imported) to avoid a circular
+    import between orchestrator and watcher; ``app.main.lifespan`` wires it
+    to ``watch_session_deliverables``. When omitted (legacy callers, unit
+    tests), watcher re-spawn is skipped without erroring.
 
     Requirements: 23.1, 23.2, 23.3, 23.4, 6.8
     """
@@ -999,6 +1009,24 @@ async def recover_sessions(
                     await transition(session_id, "idle")
                     task = asyncio.create_task(run_session(session_id, sandbox))
                     orchestrator_tasks[session_id] = task
+
+                    # PR5 D4 — re-attach the deliverables watcher. Its boot
+                    # scan picks up files written to the outputs bind while
+                    # the api was down; the awatch loop then takes over.
+                    if spawn_watcher is not None and watcher_tasks is not None:
+                        watcher_task = asyncio.create_task(spawn_watcher(session_id))
+
+                        def _watcher_done(t: asyncio.Task, _sid: str = session_id) -> None:
+                            if t.cancelled():
+                                return
+                            exc = t.exception()
+                            if exc:
+                                logger.error(
+                                    "Recovered watcher for session %s failed: %s", _sid, exc,
+                                )
+
+                        watcher_task.add_done_callback(_watcher_done)
+                        watcher_tasks[session_id] = watcher_task
                 except Exception:
                     # Container is gone
                     await transition(session_id, "failed")

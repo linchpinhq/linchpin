@@ -17,6 +17,7 @@ import abc
 import hashlib
 import logging
 import os
+import stat
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 
@@ -203,33 +204,53 @@ class LocalFileStore(FileStore):
     ) -> tuple[str, str, int]:
         """Hash + move ``source_path`` into the content-addressed layout.
 
-        Reuses the same sha256-bucketed layout as ``write()``. Uses
-        ``shutil.copy2`` (preserves mtime) rather than ``os.replace`` so the
-        source bind isn't moved out from under a still-writing agent process
-        — the deliverables watcher's caller can ``os.unlink`` the source
-        explicitly after a successful ingest if desired.
+        Reuses the same sha256-bucketed layout as ``write()``. Opens the
+        source with ``O_NOFOLLOW`` so a symlink planted in an agent-writable
+        bind mount (PR5 deliverables) cannot make us read or copy an
+        arbitrary host file — ``OSError(ELOOP)`` propagates and the watcher
+        drops it. ``fstat``-driven size + regular-file check closes the
+        TOCTOU window between the watcher's ``lstat`` and our open.
         """
-        size = os.path.getsize(source_path)
-        if size > max_bytes:
-            raise FileTooLargeError(max_bytes)
-
-        hasher = hashlib.sha256()
-        with open(source_path, "rb") as fh:
-            while True:
-                chunk = fh.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-        digest = hasher.hexdigest()
-        final = self._path_for(digest)
-        final.parent.mkdir(parents=True, exist_ok=True)
-        if final.exists():
-            # Content already stored — caller can drop the source.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(source_path, flags)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise IsADirectoryError(
+                    f"refusing to ingest non-regular file: {source_path}"
+                )
+            size = st.st_size
+            if size > max_bytes:
+                raise FileTooLargeError(max_bytes)
+            hasher = hashlib.sha256()
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                while True:
+                    chunk = fh.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
+            final = self._path_for(digest)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            if final.exists():
+                # Content already stored — caller can drop the source.
+                return (str(final.relative_to(self.root)), digest, size)
+            # Re-read from the validated fd into the destination so we never
+            # re-open the (potentially attacker-controlled) source path.
+            os.lseek(fd, 0, os.SEEK_SET)
+            with open(final, "wb") as out:
+                with os.fdopen(fd, "rb", closefd=False) as fh:
+                    while True:
+                        chunk = fh.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
             return (str(final.relative_to(self.root)), digest, size)
-        # Copy preserves the source so the watcher can decide when to unlink.
-        import shutil
-        shutil.copy2(source_path, final)
-        return (str(final.relative_to(self.root)), digest, size)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def absolute_path(self, storage_path: str) -> str:
         return str(self.root / storage_path)

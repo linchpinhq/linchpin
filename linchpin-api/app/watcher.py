@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import uuid
 from pathlib import Path
 
@@ -113,19 +114,37 @@ async def _already_ingested(session_id: str, sha256: str) -> bool:
 
 def _sha256_of_file(path: str) -> str:
     """Stream-hash a file from disk. Watcher fires post-write so the file
-    is small/medium and disk-bound; SHA256 is plenty fast."""
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    is small/medium and disk-bound; SHA256 is plenty fast.
+
+    Opens with ``O_NOFOLLOW`` so a symlink planted between the caller's
+    ``lstat`` and here cannot redirect us to a host file we shouldn't read.
+    A symlink raises ``OSError(ELOOP)`` which the caller treats as a drop.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        h = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
-async def _drop_oversized(host_path: str, *, reason: str, session_id: str, error: str) -> None:
-    """Unlink the host bytes (D4 — cleanup-on-drop) and emit a dropped event."""
+async def _drop_and_emit(host_path: str, *, reason: str, session_id: str, error: str) -> None:
+    """Unlink the host bytes (D4 — cleanup-on-drop) and emit a dropped event.
+
+    ``unlink`` is symlink-safe by default: it removes the link, not the
+    target. So a malicious symlink planted in the outputs bind gets cleaned
+    up without touching whatever it pointed at.
+    """
     try:
         os.unlink(host_path)
     except FileNotFoundError:
@@ -161,18 +180,39 @@ async def _ingest_one(
     exceeded → drop; FileStore happy-path → INSERT files row + emit
     `agent.deliverable` event.
     """
-    # Re-check the file still exists on disk — watchfiles can race with a
-    # quick write-then-delete; if the file is gone, nothing to do.
-    if not os.path.isfile(host_path):
-        return 0
-
+    # Re-stat the path without following symlinks. The outputs bind is
+    # writable by an untrusted container; an agent can plant a symlink
+    # pointing at any host file the api process can read (e.g. /etc/passwd).
+    # Without lstat + S_ISREG we'd happily hash + copy the symlink target
+    # into the FileStore and serve it via GET /v1/files/{id}/content.
     try:
-        size = os.path.getsize(host_path)
+        st = os.lstat(host_path)
+    except FileNotFoundError:
+        return 0
     except OSError:
         return 0
 
+    if stat.S_ISLNK(st.st_mode):
+        await _drop_and_emit(
+            host_path,
+            reason="symlink_rejected",
+            session_id=session_id,
+            error="deliverables may not be symlinks (host-file exfiltration guard)",
+        )
+        return 0
+    if not stat.S_ISREG(st.st_mode):
+        await _drop_and_emit(
+            host_path,
+            reason="non_regular_file",
+            session_id=session_id,
+            error=f"deliverable is not a regular file (mode={st.st_mode:o})",
+        )
+        return 0
+
+    size = st.st_size
+
     if size > per_file_cap:
-        await _drop_oversized(
+        await _drop_and_emit(
             host_path,
             reason="per_file_cap_exceeded",
             session_id=session_id,
@@ -180,7 +220,7 @@ async def _ingest_one(
         )
         return 0
     if used_so_far + size > aggregate_cap:
-        await _drop_oversized(
+        await _drop_and_emit(
             host_path,
             reason="aggregate_cap_exceeded",
             session_id=session_id,
@@ -195,6 +235,17 @@ async def _ingest_one(
         sha256 = _sha256_of_file(host_path)
     except FileNotFoundError:
         return 0
+    except OSError as exc:
+        # TOCTOU: path was a regular file at lstat time but is now a
+        # symlink (or otherwise unreadable). O_NOFOLLOW in _sha256_of_file
+        # raises ELOOP; treat it as a drop.
+        await _drop_and_emit(
+            host_path,
+            reason="symlink_rejected",
+            session_id=session_id,
+            error=f"open refused to follow symlink during hash: {exc!r}",
+        )
+        return 0
 
     if await _already_ingested(session_id, sha256):
         # Boot scan / debounce double-fire: this exact content is already
@@ -208,18 +259,35 @@ async def _ingest_one(
     except FileTooLargeError:
         # Re-raise to drop — shouldn't normally happen since we checked above,
         # but keeps the FileStore contract honest.
-        await _drop_oversized(
+        await _drop_and_emit(
             host_path,
             reason="per_file_cap_exceeded",
             session_id=session_id,
             error=f"FileStore rejected size > {per_file_cap}B",
         )
         return 0
+    except OSError as exc:
+        # Same TOCTOU window as _sha256_of_file: O_NOFOLLOW in
+        # LocalFileStore.write_from_path raises ELOOP on a late symlink.
+        await _drop_and_emit(
+            host_path,
+            reason="symlink_rejected",
+            session_id=session_id,
+            error=f"FileStore refused to follow symlink: {exc!r}",
+        )
+        return 0
 
     file_id = uuid.uuid4()
     filename = os.path.basename(host_path)
     content_type = _guess_content_type(filename)
-    await execute(
+    # Target the partial unique index from migration 0005
+    # (files_session_sha_uidx on (scope_id, sha256) WHERE scope_type='session'
+    # AND archived_at IS NULL). RETURNING id only yields a row when the
+    # INSERT actually wrote — if the dedup-on-sha lost the race and
+    # ON CONFLICT skipped, ``inserted`` is None and we suppress both the
+    # event and the size accounting so the watcher doesn't double-emit
+    # `agent.deliverable` for the same content.
+    inserted = await fetch_one(
         """
         INSERT INTO files
             (id, filename, content_type, size_bytes,
@@ -228,7 +296,10 @@ async def _ingest_one(
         VALUES ($1, $2, $3, $4,
                 $5, $6, 'deliverable', TRUE,
                 'session', $7)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (scope_id, sha256)
+            WHERE scope_type = 'session' AND archived_at IS NULL
+            DO NOTHING
+        RETURNING id
         """,
         file_id,
         filename,
@@ -238,6 +309,12 @@ async def _ingest_one(
         sha256,
         uuid.UUID(session_id),
     )
+    if inserted is None:
+        # Dedup race: another path (concurrent boot scan + awatch, or a
+        # future split-task ingest) already wrote this content. Do not
+        # emit `agent.deliverable` again and do not bump the aggregate
+        # counter — the prior winner already did both.
+        return 0
     try:
         await append_event(
             session_id,
