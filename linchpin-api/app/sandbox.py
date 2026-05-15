@@ -21,7 +21,12 @@ import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 
 
-DEFAULT_BASE_IMAGE = "ubuntu:22.04"
+# v0.2.0 item #13 — sessions default to the richer linchpin-sandbox image
+# (Python 3.12, Node 20, Go 1.22, Rust 1.77, Java 17, Ruby 3.1, PHP 8.2,
+# GCC 13, plus psql/redis-cli/rg/tree/htop). Dockerfile lives at
+# linchpin-sandbox/Dockerfile in the repo. Override with LINCHPIN_SANDBOX_IMAGE
+# for tests or for ops to roll back to a slimmer image.
+DEFAULT_BASE_IMAGE = "linchpinhq/sandbox:v0.2.0"
 
 
 @dataclass(frozen=True, slots=True)
