@@ -551,8 +551,14 @@ async def get_session_events(
     session_id: str,
     after_cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
+    types: list[str] | None = Query(default=None, alias="types[]"),
 ) -> PaginatedEventsResponse:
-    """Get events for a session with cursor-based pagination."""
+    """Get events for a session with cursor-based pagination.
+
+    v0.2.0 item #12 — optional ``?types[]=X&types[]=Y`` filter restricts the
+    response to events whose ``type`` is in the list. Unknown type strings
+    return 422 with the offender, rather than a silent empty result set.
+    """
     try:
         uid = uuid.UUID(session_id)
     except ValueError:
@@ -568,7 +574,33 @@ async def get_session_events(
             detail={"error": "not_found", "message": f"Session {session_id} not found"},
         )
 
-    result = await get_events(session_id, after_cursor=after_cursor, limit=limit)
+    # `?types[]=` (no value) is parsed by Starlette as [""], not None. Treat
+    # blank/whitespace entries as "no filter" so an empty query string behaves
+    # the same as omitting the param — the documented contract.
+    if types is not None:
+        types = [t for t in types if t and t.strip()]
+        if not types:
+            types = None
+
+    # Validate every requested type against EVENT_TYPES so we return a
+    # clean 422 with the offender, rather than a silent empty result set.
+    if types:
+        from app.models import EVENT_TYPES
+        invalid = [t for t in types if t not in EVENT_TYPES]
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_event_type",
+                    "message": (
+                        f"unknown event type(s): {invalid!r}. "
+                        f"Valid types: {sorted(EVENT_TYPES)}"
+                    ),
+                    "invalid": invalid,
+                },
+            )
+
+    result = await get_events(session_id, after_cursor=after_cursor, limit=limit, types=types)
     return result
 
 

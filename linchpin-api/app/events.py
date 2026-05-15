@@ -140,39 +140,40 @@ async def get_events(
     session_id: str,
     after_cursor: str | None = None,
     limit: int = 50,
+    types: list[str] | None = None,
 ) -> PaginatedEventsResponse:
     """Retrieve events for a session with cursor-based pagination.
 
     - If after_cursor is provided, returns events with seq > decoded cursor seq.
+    - If types is provided (v0.2.0 item #12), returns only events whose ``type``
+      is in the list. Validation of type strings against ``EVENT_TYPES`` is the
+      route handler's job — this helper passes the list through to the SQL
+      ``WHERE type = ANY($N)`` clause as-is.
     - Results ordered by seq ASC.
     - Fetches limit + 1 rows to detect has_more / next_cursor.
     """
     sid = uuid.UUID(session_id)
 
+    # Build the query incrementally based on which filters are active. Using
+    # $N positional args keeps asyncpg happy; the alternative (string-interp
+    # of the WHERE) would re-introduce SQL injection risk.
+    where_clauses = ["session_id = $1"]
+    params: list = [sid]
     if after_cursor is not None:
-        after_seq = decode_cursor(after_cursor)
-        rows = await fetch_all(
-            """
-            SELECT * FROM events
-            WHERE session_id = $1 AND seq > $2
-            ORDER BY seq ASC
-            LIMIT $3
-            """,
-            sid,
-            after_seq,
-            limit + 1,
-        )
-    else:
-        rows = await fetch_all(
-            """
-            SELECT * FROM events
-            WHERE session_id = $1
-            ORDER BY seq ASC
-            LIMIT $2
-            """,
-            sid,
-            limit + 1,
-        )
+        params.append(decode_cursor(after_cursor))
+        where_clauses.append(f"seq > ${len(params)}")
+    if types:
+        params.append(types)
+        where_clauses.append(f"type = ANY(${len(params)})")
+    params.append(limit + 1)
+    limit_ph = f"${len(params)}"
+
+    sql = (
+        "SELECT * FROM events WHERE "
+        + " AND ".join(where_clauses)
+        + f" ORDER BY seq ASC LIMIT {limit_ph}"
+    )
+    rows = await fetch_all(sql, *params)
 
     has_more = len(rows) > limit
     result_rows = rows[:limit]
