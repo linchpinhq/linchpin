@@ -29,6 +29,7 @@ from app.files import get_file_store
 from app.orchestrator import run_session
 from app.sandbox import ResourceMount, SandboxError
 from app.streaming import get_stream
+from app.watcher import ensure_session_outputs_dir, watch_session_deliverables
 from app.models import (
     CreateSessionRequest,
     EventResponse,
@@ -267,14 +268,18 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         env_config = json.loads(env_config)
     network = _network_for_environment(env_config)
 
-    # Build the read-only mount list (D1 — plain `:ro` bind, no overlay2).
-    # Per-resource mount-time re-check catches files deleted between the
-    # upfront validation and now; failures get state='failed' rows and a
-    # session.resource_mount_failed event after the session row exists.
-    # FileStore is lazy-initialized only when there are resources to mount
-    # so v0.1-shape session creates (no resources) don't trigger a mkdir on
-    # LINCHPIN_FILES_ROOT (which defaults to /var/lib/linchpin and requires
-    # root permission outside production).
+    # Generate the session id up front so PR5's per-session outputs bind can
+    # be set up before the container starts. The id is also used to scope the
+    # deliverables watcher task.
+    session_id = str(uuid.uuid4())
+
+    # Build the read-only mount list for file resources (D1 — plain `:ro`
+    # bind, no overlay2). Per-resource mount-time re-check catches files
+    # deleted between upfront validation and now; failures get state='failed'
+    # rows and a session.resource_mount_failed event after the session row
+    # exists. FileStore is lazy-initialized only when there are resources to
+    # mount so v0.1-shape session creates (no resources) don't trigger a
+    # mkdir on LINCHPIN_FILES_ROOT.
     mounts: list[ResourceMount] = []
     resource_states: list[tuple[str, str | None]] = []  # parallel to body.resources
     seen_host_paths: dict[str, str] = {}  # host_path -> mount_path of first claimant
@@ -331,7 +336,17 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         ))
         resource_states.append(("mounted", None))
 
-    # Provision Docker container via sandbox with the read-only mounts.
+    # PR5 — writable bind for deliverables. The container sees
+    # /mnt/session/outputs/ as writable; the watcher (asyncio task per
+    # session, spawned below) mirrors host-side writes into the Files API.
+    outputs_dir = ensure_session_outputs_dir(session_id)
+    mounts.append(ResourceMount(
+        host_path=str(outputs_dir),
+        container_path="/mnt/session/outputs",
+        mode="rw",
+    ))
+
+    # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
     image = ""  # empty string lets DockerSandbox use default/env var
     try:
@@ -353,7 +368,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     # cancellation), we must destroy the container or it'll run forever with
     # no row pointing at it — recover_sessions only walks the sessions
     # table. Wrap the whole block and clean up on any failure.
-    session_id = str(uuid.uuid4())
+    # (session_id was generated above so the PR5 outputs bind could use it.)
     try:
         agent_version = agent_row["version"]
         metadata_json = json.dumps(body.metadata)
@@ -485,6 +500,26 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
 
     task.add_done_callback(_task_done)
     request.app.state.orchestrator_tasks[session_id] = task
+
+    # PR5 — spawn the deliverables watcher as a per-session asyncio task (D3).
+    # Watches host-side /mnt/session/outputs/{sid} for new files written by
+    # the agent and registers them as deliverables in the Files API. Cancelled
+    # in terminate_session.
+    watcher_task = asyncio.create_task(watch_session_deliverables(session_id))
+
+    def _watcher_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("Watcher task for session %s failed: %s", session_id, exc)
+
+    watcher_task.add_done_callback(_watcher_done)
+    watcher_tasks = getattr(request.app.state, "watcher_tasks", None)
+    if watcher_tasks is None:
+        watcher_tasks = {}
+        request.app.state.watcher_tasks = watcher_tasks
+    watcher_tasks[session_id] = watcher_task
 
     return _row_to_session(row, resources=resources)
 
@@ -651,6 +686,14 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
     task = orchestrator_tasks.pop(session_id, None)
     if task is not None and not task.done():
         task.cancel()
+
+    # PR5 — cancel the deliverables watcher task. Boot scan on next start
+    # (D4) picks up anything written between now and a future restart, so
+    # the cancel is safe even if there are in-flight deliverables.
+    watcher_tasks = getattr(request.app.state, "watcher_tasks", {})
+    watcher_task = watcher_tasks.pop(session_id, None)
+    if watcher_task is not None and not watcher_task.done():
+        watcher_task.cancel()
 
     # Destroy the container
     container_id = row["container_id"]

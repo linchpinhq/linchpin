@@ -32,6 +32,8 @@ EVENT_TYPES: frozenset[str] = frozenset({
     "agent.mcp_tool_use",
     "agent.mcp_tool_result",
     "agent.custom_tool_use",
+    "agent.deliverable",            # PR5 — D5
+    "agent.deliverable_dropped",    # PR5 — D5
     # Session events
     "session.status_running",
     "session.status_idle",
@@ -58,6 +60,8 @@ EventType = Literal[
     "agent.mcp_tool_use",
     "agent.mcp_tool_result",
     "agent.custom_tool_use",
+    "agent.deliverable",
+    "agent.deliverable_dropped",
     "session.status_running",
     "session.status_idle",
     "session.status_rescheduled",

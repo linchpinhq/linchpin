@@ -93,8 +93,18 @@ def _session_row(
 
 
 @pytest.fixture()
-def lifecycle_client():
-    """TestClient with mocked sandbox and orchestrator for lifecycle tests."""
+def lifecycle_client(tmp_path):
+    """TestClient with mocked sandbox and orchestrator for lifecycle tests.
+
+    PR5 — patches the deliverables watcher so the per-session outputs dir
+    writes to tmp_path rather than /var/lib/linchpin and no real watcher
+    task spawns.
+    """
+    def _fake_ensure(sid):
+        p = tmp_path / "session-outputs" / sid
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
     with (
         patch("app.main.check_migrations_current"),
         patch("app.main.create_pool", new_callable=AsyncMock),
@@ -104,6 +114,8 @@ def lifecycle_client():
         patch("app.main.cleanup_expired_sessions", new_callable=AsyncMock),
         patch("app.main.recover_sessions", new_callable=AsyncMock),
         patch("app.routes.sessions.run_session", new_callable=AsyncMock),
+        patch("app.routes.sessions.ensure_session_outputs_dir", side_effect=_fake_ensure),
+        patch("app.routes.sessions.watch_session_deliverables", new_callable=AsyncMock),
     ):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-integ")
@@ -200,7 +212,13 @@ class TestSessionLifecycle:
         assert created_session["status"] == "running"
         assert created_session["agent_id"] == agent_id
         assert created_session["environment_id"] == env_id
-        mock_sandbox.create.assert_called_once_with("", "linchpin-none", mounts=[])
+        # PR5 — mounts always contains the writable /mnt/session/outputs bind.
+        args, kwargs = mock_sandbox.create.call_args
+        assert args == ("", "linchpin-none")
+        assert any(
+            m.container_path == "/mnt/session/outputs" and m.mode == "rw"
+            for m in kwargs["mounts"]
+        )
 
         # --- Step 4: Send a user.message event ---
         mock_session_fetch.side_effect = None
@@ -289,7 +307,12 @@ class TestSessionLifecycle:
             headers=AUTH,
         )
         assert resp.status_code == 201
-        mock_sandbox.create.assert_called_with("", "linchpin-open", mounts=[])
+        args, kwargs = mock_sandbox.create.call_args
+        assert args == ("", "linchpin-open")
+        assert any(
+            m.container_path == "/mnt/session/outputs"
+            for m in kwargs["mounts"]
+        )
 
     @patch("app.routes.sessions.notify", new_callable=AsyncMock)
     @patch("app.routes.sessions.append_event", new_callable=AsyncMock)

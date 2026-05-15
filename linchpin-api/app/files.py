@@ -24,6 +24,7 @@ logger = logging.getLogger("linchpin-api.files")
 
 DEFAULT_FILES_ROOT = "/var/lib/linchpin/files"
 DEFAULT_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+DEFAULT_PER_SESSION_CAP_BYTES = 1024 * 1024 * 1024  # 1 GB — PR5, spec line 320
 
 # Stream chunk size for upload / download. 1 MiB balances memory pressure
 # against syscall overhead on typical SSDs.
@@ -42,6 +43,43 @@ def get_max_bytes() -> int:
     if value <= 0:
         raise RuntimeError(f"LINCHPIN_FILES_MAX_BYTES must be positive, got: {value}")
     return value
+
+
+def get_per_session_cap_bytes() -> int:
+    """Aggregate deliverable cap per session from
+    ``LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES`` (PR5)."""
+    raw = os.environ.get("LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES")
+    if raw is None:
+        return DEFAULT_PER_SESSION_CAP_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES must be an integer, got: {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            f"LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES must be positive, got: {value}"
+        )
+    return value
+
+
+def get_session_outputs_root() -> str:
+    """Host-side root for per-session writable output binds (PR5).
+
+    The deliverables watcher (in-process per session per D3) watches
+    ``<root>/<session_id>/`` and the container sees that path bind-mounted
+    at ``/mnt/session/outputs/`` (writable). Defaults to
+    ``LINCHPIN_FILES_ROOT/_session_outputs`` so a single permission check
+    on the FileStore root covers it.
+    """
+    explicit = os.environ.get("LINCHPIN_SESSION_OUTPUTS_ROOT")
+    if explicit:
+        return explicit
+    return os.path.join(
+        os.environ.get("LINCHPIN_FILES_ROOT") or DEFAULT_FILES_ROOT,
+        "_session_outputs",
+    )
 
 
 class FileTooLargeError(Exception):
@@ -74,6 +112,19 @@ class FileStore(abc.ABC):
     @abc.abstractmethod
     async def delete(self, storage_path: str) -> None:
         """Remove the bytes at ``storage_path``. Idempotent."""
+
+    @abc.abstractmethod
+    async def write_from_path(
+        self, source_path: str, *, max_bytes: int
+    ) -> tuple[str, str, int]:
+        """Ingest an existing on-disk file at ``source_path`` into the store.
+
+        Returns ``(storage_path, sha256, size_bytes)`` like ``write()``. Used
+        by the deliverables watcher (PR5) which sees files the agent already
+        wrote to the session-outputs bind. Raises ``FileTooLargeError`` when
+        the source exceeds ``max_bytes``; the source file is left in place
+        either way (the caller decides whether to ``os.unlink`` on drop).
+        """
 
     @abc.abstractmethod
     def absolute_path(self, storage_path: str) -> str:
@@ -146,6 +197,39 @@ class LocalFileStore(FileStore):
             full.unlink()
         except FileNotFoundError:
             return
+
+    async def write_from_path(
+        self, source_path: str, *, max_bytes: int
+    ) -> tuple[str, str, int]:
+        """Hash + move ``source_path`` into the content-addressed layout.
+
+        Reuses the same sha256-bucketed layout as ``write()``. Uses
+        ``shutil.copy2`` (preserves mtime) rather than ``os.replace`` so the
+        source bind isn't moved out from under a still-writing agent process
+        — the deliverables watcher's caller can ``os.unlink`` the source
+        explicitly after a successful ingest if desired.
+        """
+        size = os.path.getsize(source_path)
+        if size > max_bytes:
+            raise FileTooLargeError(max_bytes)
+
+        hasher = hashlib.sha256()
+        with open(source_path, "rb") as fh:
+            while True:
+                chunk = fh.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+        final = self._path_for(digest)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        if final.exists():
+            # Content already stored — caller can drop the source.
+            return (str(final.relative_to(self.root)), digest, size)
+        # Copy preserves the source so the watcher can decide when to unlink.
+        import shutil
+        shutil.copy2(source_path, final)
+        return (str(final.relative_to(self.root)), digest, size)
 
     def absolute_path(self, storage_path: str) -> str:
         return str(self.root / storage_path)

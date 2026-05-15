@@ -75,8 +75,19 @@ def _make_session_row(
 
 
 @pytest.fixture()
-def sandbox_client():
-    """Return a TestClient with a mocked sandbox on app.state."""
+def sandbox_client(tmp_path):
+    """Return a TestClient with a mocked sandbox on app.state.
+
+    PR5 — patches the deliverables watcher hooks so tests don't try to
+    mkdir under /var/lib/linchpin or spin up real watchfiles tasks.
+    """
+    from pathlib import Path
+
+    def _fake_ensure(sid):
+        p = tmp_path / "session-outputs" / sid
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
     with (
         patch("app.main.check_migrations_current"),
         patch("app.main.create_pool", new_callable=AsyncMock),
@@ -86,6 +97,8 @@ def sandbox_client():
         patch("app.main.cleanup_expired_sessions", new_callable=AsyncMock),
         patch("app.main.recover_sessions", new_callable=AsyncMock),
         patch("app.routes.sessions.run_session", new_callable=AsyncMock) as mock_run_session,
+        patch("app.routes.sessions.ensure_session_outputs_dir", side_effect=_fake_ensure),
+        patch("app.routes.sessions.watch_session_deliverables", new_callable=AsyncMock),
     ):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-abc")
@@ -145,9 +158,14 @@ def test_create_session_unrestricted_network(mock_fetch, sandbox_client):
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
 
     assert resp.status_code == 201
-    # Verify sandbox.create was called with linchpin-open (PR3 — empty mounts list
-    # is passed for no-resources requests).
-    mock_sandbox.create.assert_called_once_with("", "linchpin-open", mounts=[])
+    # PR3 — image + network as positional args. PR5 — mounts always contains
+    # at least the writable /mnt/session/outputs bind; no resources means
+    # exactly that one entry.
+    args, kwargs = mock_sandbox.create.call_args
+    assert args == ("", "linchpin-open")
+    assert len(kwargs["mounts"]) == 1
+    assert kwargs["mounts"][0].container_path == "/mnt/session/outputs"
+    assert kwargs["mounts"][0].mode == "rw"
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
@@ -167,7 +185,10 @@ def test_create_session_none_network(mock_fetch, sandbox_client):
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
 
     assert resp.status_code == 201
-    mock_sandbox.create.assert_called_once_with("", "linchpin-none", mounts=[])
+    args, kwargs = mock_sandbox.create.call_args
+    assert args == ("", "linchpin-none")
+    assert len(kwargs["mounts"]) == 1
+    assert kwargs["mounts"][0].container_path == "/mnt/session/outputs"
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
