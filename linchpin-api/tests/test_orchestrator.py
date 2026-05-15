@@ -316,6 +316,24 @@ class TestRunSessionTextResponse:
         # Verify session.status_idle was emitted
         assert "session.status_idle" in event_types
 
+        # v0.2.0 item #9 — span events bracket the model request
+        span_events = [(etype, payload) for etype, payload in appended_events
+                       if etype in ("span.model_request_start", "span.model_request_end")]
+        start_events = [p for etype, p in span_events if etype == "span.model_request_start"]
+        end_events = [p for etype, p in span_events if etype == "span.model_request_end"]
+        assert len(start_events) >= 1, "span.model_request_start not emitted"
+        assert len(end_events) >= 1, "span.model_request_end not emitted"
+        # First start/end share a span_id (paired)
+        assert start_events[0]["span_id"] == end_events[0]["span_id"]
+        # Start carries model metadata; end carries elapsed_ms + model_usage
+        assert "model" in start_events[0]
+        assert start_events[0]["model"]["provider"] == agent.model.provider
+        assert end_events[0]["elapsed_ms"] >= 0
+        assert end_events[0]["model_usage"]["input_tokens"] == 10
+        assert end_events[0]["model_usage"]["output_tokens"] == 5
+        # No "error" field on successful end
+        assert end_events[0].get("error") is None
+
 
 class TestRunSessionToolUseAlwaysAllow:
     """Tool use with always_allow → execute immediately."""

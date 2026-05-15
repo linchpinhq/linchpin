@@ -39,6 +39,9 @@ EVENT_TYPES: frozenset[str] = frozenset({
     "session.status_terminated",
     "session.error",
     "session.requires_action",
+    # Span events — v0.2.0 item #9
+    "span.model_request_start",
+    "span.model_request_end",
 })
 
 EventType = Literal[
@@ -60,6 +63,8 @@ EventType = Literal[
     "session.status_terminated",
     "session.error",
     "session.requires_action",
+    "span.model_request_start",
+    "span.model_request_end",
 ]
 
 
