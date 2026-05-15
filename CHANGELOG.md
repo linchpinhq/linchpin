@@ -4,6 +4,11 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 ## [Unreleased]
 
+### Added
+
+- **Files API (v0.2.0 PR1 — items #1/#2 prep).** `POST /v1/files` (multipart upload), `GET /v1/files` (scope-filtered, paginated), `GET /v1/files/{id}`, `GET /v1/files/{id}/content` (streams; 403 unless `downloadable`), `DELETE /v1/files/{id}`. Content-addressable local-fs `FileStore` deduplicates identical uploads by sha256. Per-file size cap via `LINCHPIN_FILES_MAX_BYTES` (default 500 MB). Storage root via `LINCHPIN_FILES_ROOT` (default `/var/lib/linchpin/files`).
+- New `files` table and indexes (Alembic `0003_files`).
+
 ## [0.1.0] - 2026-05-13
 
 First formal release — the launch baseline. Tags the post-launch contents of `main` so everything before this point is "pre-release" and everything after follows the documented versioning + deprecation rules.
