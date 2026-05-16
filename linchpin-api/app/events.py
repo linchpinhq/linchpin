@@ -154,7 +154,7 @@ async def append_event(
             sid,
         )
 
-    return Event(
+    event = Event(
         session_id=str(event_row["session_id"]),
         cursor=event_row["cursor"],
         seq=event_row["seq"],
@@ -162,6 +162,25 @@ async def append_event(
         payload=json.loads(event_row["payload"]) if isinstance(event_row["payload"], str) else event_row["payload"],
         processed_at=event_row["processed_at"],
     )
+
+    # v0.2.0 item #14 — fan webhook-relevant events out to subscribers.
+    # Imported lazily so a fresh DB without the webhooks table (legacy
+    # snapshots, smoke-test fixtures) doesn't crash event emission.
+    try:
+        from app.webhooks import enqueue_event
+
+        await enqueue_event(event_type, {
+            "session_id": event.session_id,
+            "cursor": event.cursor,
+            "seq": event.seq,
+            "type": event.type,
+            "payload": event.payload,
+        })
+    except Exception:
+        # Webhook fan-out must never break the agent loop. Logged in webhooks.
+        pass
+
+    return event
 
 
 # ---------------------------------------------------------------------------
