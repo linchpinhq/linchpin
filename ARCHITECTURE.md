@@ -60,14 +60,15 @@ graph TB
 
 ### Sandbox network policy
 
-The startup hook in `linchpin-api` pre-creates two Docker networks:
+The startup hook in `linchpin-api` pre-creates three Docker networks:
 
-| `networking.type` | Network |
-|---|---|
-| `none` | `linchpin-none` (no egress) |
-| `unrestricted` | `linchpin-open` |
+| `networking.type` | Network | Egress |
+|---|---|---|
+| `none` | `linchpin-none` | denied (internal bridge) |
+| `unrestricted` | `linchpin-open` | unrestricted |
+| `limited` (v0.2.0 item #4) | `linchpin-limited` | denied in v0.2.0 · allowlist proxy in v0.2.x |
 
-Each session container is attached to one of these based on its environment config.
+Each session container is attached to one of these based on its environment config. `limited` mode also carries `allowed_hosts`, `allow_mcp_servers`, and `allow_package_managers` fields that are persisted on the environment for the v0.2.x egress proxy to consult.
 
 ### Sandbox image — base + derived (v0.2.0 item #3)
 

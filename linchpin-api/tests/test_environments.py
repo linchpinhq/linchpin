@@ -372,3 +372,113 @@ def test_create_environment_rejects_too_many_packages(client):
     }
     resp = client.post("/v1/environments", json=payload, headers=AUTH)
     assert resp.status_code == 422
+
+
+# ---- v0.2.0 item #4 — limited networking ----
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_create_environment_with_limited_networking(mock_fetch, client):
+    """Limited mode round-trips through the API with all sub-fields."""
+    config = {
+        "networking": {
+            "type": "limited",
+            "allowed_hosts": ["api.github.com", "*.linear.app", "192.168.1.10"],
+            "allow_mcp_servers": True,
+            "allow_package_managers": False,
+        },
+    }
+    mock_fetch.return_value = _make_env_row(config=config)
+
+    payload = {"name": "limited-env", "config": config}
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["config"]["networking"]["type"] == "limited"
+    assert body["config"]["networking"]["allowed_hosts"] == [
+        "api.github.com", "*.linear.app", "192.168.1.10",
+    ]
+    assert body["config"]["networking"]["allow_mcp_servers"] is True
+    assert body["config"]["networking"]["allow_package_managers"] is False
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_create_environment_limited_defaults_to_empty_allowlist(mock_fetch, client):
+    """`limited` with no sub-fields defaults to empty list + booleans False."""
+    config = {"networking": {"type": "limited"}}
+    mock_fetch.return_value = _make_env_row(config={
+        "networking": {
+            "type": "limited",
+            "allowed_hosts": [],
+            "allow_mcp_servers": False,
+            "allow_package_managers": False,
+        },
+    })
+
+    payload = {"name": "lim-empty", "config": config}
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201
+    net = resp.json()["config"]["networking"]
+    assert net["allowed_hosts"] == []
+    assert net["allow_mcp_servers"] is False
+    assert net["allow_package_managers"] is False
+
+
+@pytest.mark.parametrize("bad_host", [
+    "https://example.com",       # scheme
+    "example.com:443",            # port
+    "example.com/path",           # path
+    "example.com space",          # space
+    "-leadinghyphen.com",         # leading hyphen
+    "..invalid..",                # consecutive dots
+    "",                            # empty
+])
+def test_create_environment_limited_rejects_bad_allowed_host(client, bad_host):
+    payload = {
+        "name": "bad-host",
+        "config": {
+            "networking": {"type": "limited", "allowed_hosts": [bad_host]},
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_create_environment_limited_rejects_duplicate_allowed_hosts(client):
+    payload = {
+        "name": "dup-host",
+        "config": {
+            "networking": {
+                "type": "limited",
+                "allowed_hosts": ["api.github.com", "api.github.com"],
+            },
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_create_environment_limited_rejects_too_many_allowed_hosts(client):
+    payload = {
+        "name": "huge-host",
+        "config": {
+            "networking": {
+                "type": "limited",
+                "allowed_hosts": [f"h{i}.example.com" for i in range(257)],
+            },
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_create_environment_rejects_unknown_networking_type(client):
+    """Discriminator now covers none/unrestricted/limited only."""
+    payload = {
+        "name": "bad-type",
+        "config": {"networking": {"type": "bridge"}},
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422

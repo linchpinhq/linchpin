@@ -119,11 +119,20 @@ async def _load_session_resources(session_id: uuid.UUID) -> list[SessionResource
 
 
 def _network_for_environment(config: dict) -> str:
-    """Determine the Docker network name from an environment config dict."""
+    """Determine the Docker network name from an environment config dict.
+
+    v0.2.0 item #4 — `limited` mode maps to `linchpin-limited`. In v0.2.0
+    that network is an internal bridge (same as `linchpin-none`); v0.2.x
+    will add the egress proxy that turns the env's `allowed_hosts` /
+    `allow_mcp_servers` / `allow_package_managers` lists into actual
+    permitted traffic.
+    """
     networking = config.get("networking", {})
     net_type = networking.get("type", "none")
     if net_type == "unrestricted":
         return "linchpin-open"
+    if net_type == "limited":
+        return "linchpin-limited"
     return "linchpin-none"
 
 
