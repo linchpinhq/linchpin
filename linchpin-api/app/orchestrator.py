@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 import httpx
 
-from app.db import fetch_all, fetch_one, listen, notify
+from app.db import execute, fetch_all, fetch_one, listen, notify
 from app.events import append_event
 from app.models import Agent, BuiltinToolConfig, CustomToolConfig, MCPServerConfig, ModelConfig
 from app.policy import PolicyEvaluator
@@ -1073,6 +1073,16 @@ async def cleanup_expired_sessions(
                 try:
                     # Update status to terminated
                     await transition(session_id, "terminated")
+                    # Mirror terminate_session: drop any live resource mounts
+                    # to 'unmounted' so DELETE /v1/files no longer 409s on
+                    # files that were only mounted in TTL-expired sessions.
+                    await execute(
+                        """UPDATE session_resources
+                           SET state = 'unmounted', unmounted_at = now()
+                           WHERE session_id = $1
+                             AND state IN ('mounted', 'unmounting')""",
+                        uuid.UUID(session_id),
+                    )
                     await append_event(session_id, "session.status_terminated", {
                         "reason": "ttl_expired",
                     })

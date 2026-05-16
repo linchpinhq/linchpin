@@ -127,6 +127,7 @@ class TestSessionLifecycle:
     """
 
     @patch("app.routes.sessions.notify", new_callable=AsyncMock)
+    @patch("app.routes.sessions.execute", new_callable=AsyncMock)
     @patch("app.routes.sessions.append_event", new_callable=AsyncMock)
     @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
     @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
@@ -143,6 +144,7 @@ class TestSessionLifecycle:
         mock_session_fetch_all,
         mock_session_fetch,
         mock_append,
+        _mock_session_execute,
         mock_notify,
         lifecycle_client,
     ):

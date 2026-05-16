@@ -376,10 +376,12 @@ def test_update_session_not_found(mock_fetch, sandbox_client):
 # ---- DELETE /v1/sessions/{id} ----
 
 
+@patch("app.routes.sessions.execute", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_terminate_session(mock_fetch, mock_fetch_all, sandbox_client):
-    """Terminating a session sets status to terminated and destroys container."""
+def test_terminate_session(mock_fetch, mock_fetch_all, mock_execute, sandbox_client):
+    """Terminating a session sets status to terminated, transitions live
+    session_resources to 'unmounted', and destroys the container."""
     client, mock_sandbox = sandbox_client
     sid = str(uuid.uuid4())
     existing = _make_session_row(session_id=sid)
@@ -393,6 +395,17 @@ def test_terminate_session(mock_fetch, mock_fetch_all, sandbox_client):
     assert resp.status_code == 200
     assert resp.json()["status"] == "terminated"
     mock_sandbox.destroy.assert_called_once_with("container-abc")
+    # PR3 — resource state must transition to 'unmounted' so DELETE /v1/files
+    # no longer 409s on files that were only mounted in this terminated session.
+    update_sql_calls = [
+        c for c in mock_execute.call_args_list
+        if "UPDATE session_resources" in (c.args[0] if c.args else "")
+        and "state = 'unmounted'" in (c.args[0] if c.args else "")
+    ]
+    assert len(update_sql_calls) == 1, (
+        f"terminate_session must UPDATE session_resources state to 'unmounted'; "
+        f"got execute calls: {[c.args[0][:80] for c in mock_execute.call_args_list]}"
+    )
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)

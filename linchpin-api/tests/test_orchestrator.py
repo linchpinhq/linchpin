@@ -1694,11 +1694,22 @@ class TestCleanupExpiredSessions:
             patch("app.orchestrator.fetch_all", side_effect=mock_fetch_all),
             patch("app.orchestrator.transition", side_effect=mock_transition),
             patch("app.orchestrator.append_event", side_effect=mock_append),
+            # PR3 — TTL cleanup now also UPDATEs session_resources state.
+            patch("app.orchestrator.execute", new_callable=AsyncMock) as mock_exec,
         ):
             await run_once()
 
         # Verify session was terminated
         assert (session_id, "terminated") in transitions
+        # PR3 — verify resource state was transitioned to 'unmounted' so files
+        # mounted in TTL-expired sessions are deletable again.
+        update_calls = [
+            c for c in mock_exec.call_args_list
+            if "UPDATE session_resources" in (c.args[0] if c.args else "")
+        ]
+        assert len(update_calls) == 1, (
+            "TTL cleanup must UPDATE session_resources state to 'unmounted'"
+        )
 
         # Verify session.status_terminated event was emitted
         terminated_events = [e for e in appended if e[1] == "session.status_terminated"]

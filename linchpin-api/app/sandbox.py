@@ -172,6 +172,18 @@ class DockerSandbox:
                 raise SandboxError(
                     f"ResourceMount.container_path must be absolute, got {m.container_path!r}"
                 )
+            # docker-py's ``volumes=`` dict is keyed by host_path: two mounts
+            # sharing a host_path silently collapse into the last one. The
+            # FileStore is content-addressed, so two distinct file_ids can
+            # share the same storage_path (and therefore the same host_path).
+            # Refuse loudly rather than ship a session whose container is
+            # missing a mount the API said was 'mounted'.
+            if m.host_path in volumes:
+                raise SandboxError(
+                    "duplicate host_path in mounts: "
+                    f"{m.host_path!r} appears for both "
+                    f"{volumes[m.host_path]['bind']!r} and {m.container_path!r}"
+                )
             volumes[m.host_path] = {"bind": m.container_path, "mode": m.mode}
         return volumes
 

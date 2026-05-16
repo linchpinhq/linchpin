@@ -138,6 +138,47 @@ class TestCreate:
         client.containers.run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_create_rejects_duplicate_host_path(self):
+        """docker-py ``volumes=`` is keyed by host_path; two mounts sharing
+        a host_path would silently collapse into the last one. Refuse
+        loudly so the API never claims state='mounted' for a bind that
+        didn't actually reach docker."""
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="duplicate host_path"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[
+                    ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/dup", container_path="/mnt/a"),
+                    ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/dup", container_path="/mnt/b"),
+                ],
+            )
+        client.containers.run.assert_not_called()
+
+    def test_build_volumes_preserves_distinct_host_paths(self):
+        """Sanity check: two distinct host_paths produce two volume entries."""
+        from app.sandbox import DockerSandbox
+        volumes = DockerSandbox._build_volumes([
+            ResourceMount(host_path="/host/a", container_path="/c/1"),
+            ResourceMount(host_path="/host/b", container_path="/c/2"),
+        ])
+        assert volumes == {
+            "/host/a": {"bind": "/c/1", "mode": "ro"},
+            "/host/b": {"bind": "/c/2", "mode": "ro"},
+        }
+
+    def test_build_volumes_raises_on_duplicate_host_path(self):
+        """Direct unit on the staticmethod — no docker mocks needed."""
+        from app.sandbox import DockerSandbox
+        with pytest.raises(SandboxError, match="duplicate host_path"):
+            DockerSandbox._build_volumes([
+                ResourceMount(host_path="/host/a", container_path="/c/1"),
+                ResourceMount(host_path="/host/a", container_path="/c/2"),
+            ])
+
+    @pytest.mark.asyncio
     async def test_create_pulls_on_image_not_found(self):
         from docker.errors import ImageNotFound
 

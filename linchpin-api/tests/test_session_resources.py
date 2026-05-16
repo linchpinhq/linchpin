@@ -613,8 +613,10 @@ def test_create_session_with_multiple_file_resources(mock_fetch_one, mock_fetch_
     mock_fetch_one.side_effect = [
         _make_agent_row(agent_id=agent_id),
         _make_env_row(env_id=env_id),
-        _make_file_row(file_id=file_a),
-        _make_file_row(file_id=file_b),
+        # Distinct storage_paths — two files with different content. Sharing
+        # storage_path would (correctly) 422 with duplicate_mount_source.
+        _make_file_row(file_id=file_a, storage_path="aa/bb/contentA"),
+        _make_file_row(file_id=file_b, storage_path="cc/dd/contentB"),
         _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
         _make_resource_row(session_id=sid, mount_path="/mnt/data/a", config={"file_id": file_a}),
         _make_resource_row(session_id=sid, mount_path="/mnt/data/b", config={"file_id": file_b}),
@@ -715,7 +717,9 @@ def test_terminate_session_hydrates_resources(mock_fetch_one, mock_fetch_all, sa
     mock_fetch_one.side_effect = [existing, terminated]
     mock_fetch_all.return_value = [_make_resource_row(session_id=sid, mount_path="/mnt/x")]
 
-    resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
+    # PR3 — terminate also UPDATEs session_resources state via execute(); patch it.
+    with patch("app.routes.sessions.execute", new_callable=AsyncMock):
+        resp = client.delete(f"/v1/sessions/{sid}", headers=AUTH)
     assert resp.status_code == 200
     assert [r["mount_path"] for r in resp.json()["resources"]] == ["/mnt/x"]
 
@@ -995,3 +999,203 @@ def test_delete_session_resource_returns_501(sandbox_client):
     )
     assert resp.status_code == 501
     assert resp.json()["detail"]["error"] == "not_implemented"
+
+
+# ---------------------------------------------------------------------------
+# PR3 — post-review fixes: collision, CHECK constraint, UUID canonicalization,
+# orphan-container rollback. Each test exercises a regression that the
+# original implementation would have hit on first contact with a real DB
+# or a real second mount.
+# ---------------------------------------------------------------------------
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_422_when_two_resources_share_storage_path(
+    mock_fetch_one, mock_fetch_all, sandbox_client
+):
+    """Two FileResources whose host_paths resolve to the same storage_path
+    (content-addressed dedup) must be rejected with 422 — otherwise the
+    docker-py ``volumes`` dict-key collision would silently drop one mount.
+    """
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    file_id_a = str(uuid.uuid4())
+    file_id_b = str(uuid.uuid4())
+
+    # Both file rows return identical storage_path → same host_path after
+    # FileStore.absolute_path. The PR3 fix detects this in the route loop
+    # before sandbox.create runs.
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_file_row(file_id=file_id_a, storage_path="aa/bb/sharedhash"),
+        _make_file_row(file_id=file_id_b, storage_path="aa/bb/sharedhash"),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "file", "file_id": file_id_a, "mount_path": "/mnt/a"},
+            {"type": "file", "file_id": file_id_b, "mount_path": "/mnt/b"},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_mount_source"
+    # sandbox.create must NOT have been called — collision detected pre-create.
+    mock_sandbox.create.assert_not_called()
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_persists_canonical_uuid_in_config(
+    mock_fetch_one, mock_fetch_all, sandbox_client
+):
+    """A file_id submitted in non-canonical form (no dashes, uppercase) must
+    be normalized to canonical lowercase-dashed form in JSONB config so the
+    DELETE /v1/files 409 mount-conflict check (which queries with
+    ``str(file_uid)`` — always canonical) actually fires."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    # Same UUID in two forms: canonical for the DB row, non-canonical for the POST body.
+    canonical = str(uuid.uuid4())
+    non_canonical = canonical.replace("-", "").upper()
+    assert non_canonical != canonical  # sanity: forms differ
+    sid = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_file_row(file_id=canonical, storage_path="aa/bb/canon"),
+        _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(session_id=sid, mount_path="/mnt/d", config={"file_id": canonical}),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "file", "file_id": non_canonical, "mount_path": "/mnt/d"},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    # Inspect the INSERT INTO session_resources call: 4th positional is config_json.
+    insert_call = next(
+        c for c in mock_fetch_one.call_args_list
+        if c.args and "INSERT INTO session_resources" in c.args[0]
+    )
+    config_json = insert_call.args[4]
+    config_obj = json.loads(config_json)
+    assert config_obj["file_id"] == canonical, (
+        f"file_id stored as {config_obj['file_id']!r}; expected canonical {canonical!r}"
+    )
+
+
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_marks_failed_resource_with_unmounted_at(
+    mock_fetch_one, mock_fetch_all, sandbox_client
+):
+    """The state='failed' INSERT must populate unmounted_at to satisfy the
+    session_resources_terminal_has_unmounted_at CHECK constraint
+    (migration 0004). Without unmounted_at the INSERT would CheckViolation."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    file_id = str(uuid.uuid4())
+    sid = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_file_row(file_id=file_id),
+        _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=sid,
+            mount_path="/mnt/missing.csv",
+            config={"file_id": file_id},
+            state="failed",
+        ),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "file", "file_id": file_id, "mount_path": "/mnt/missing.csv"},
+        ],
+    }
+    with patch("app.routes.sessions.os.path.isfile", return_value=False):
+        resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    # The session_resources INSERT must include unmounted_at as the 7th positional.
+    insert_call = next(
+        c for c in mock_fetch_one.call_args_list
+        if c.args and "INSERT INTO session_resources" in c.args[0]
+    )
+    sql = insert_call.args[0]
+    assert "unmounted_at" in sql, "INSERT must include unmounted_at column"
+    state = insert_call.args[5]
+    unmounted_at = insert_call.args[7]
+    assert state == "failed"
+    assert unmounted_at is not None, "failed-state INSERT must supply unmounted_at"
+
+
+@patch("app.routes.sessions.execute", new_callable=AsyncMock)
+@patch("app.routes.sessions.append_event", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_destroys_container_on_db_failure(
+    mock_fetch_one, mock_fetch_all, _mock_append, mock_execute, sandbox_client
+):
+    """If any DB write fails after sandbox.create succeeds, the orphaned
+    container must be destroyed so it doesn't linger forever."""
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    file_id = str(uuid.uuid4())
+
+    # Validation succeeds; then INSERT INTO sessions raises (e.g. transient
+    # connection failure or a constraint we forgot about).
+    class FakeDBError(Exception):
+        pass
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_file_row(file_id=file_id),
+        FakeDBError("connection reset during sessions INSERT"),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "file", "file_id": file_id, "mount_path": "/mnt/d"},
+        ],
+    }
+    # Use a fresh TestClient that doesn't reraise server exceptions, so we
+    # get the 500 response back instead of pytest exploding on the inner
+    # FakeDBError. The crucial assertion is the cleanup, not the status code.
+    from fastapi.testclient import TestClient
+    from app.main import app
+    quiet = TestClient(app, raise_server_exceptions=False)
+    quiet.headers.update(AUTH)
+    resp = quiet.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 500
+    mock_sandbox.create.assert_called_once()
+    mock_sandbox.destroy.assert_called_once_with("container-abc")
