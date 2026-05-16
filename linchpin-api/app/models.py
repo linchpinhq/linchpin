@@ -7,6 +7,9 @@ event type taxonomy as a validated literal set.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -186,10 +189,96 @@ class NetworkingConfig(BaseModel):
     type: Literal["none", "unrestricted"]
 
 
+# Package names use a conservative allowlist that admits every form we care
+# about (`pkg`, `pkg==1.2`, `@scope/pkg`, `pkg.subpkg`, `path/to/pkg@v1.0.0`
+# for `go install`) while rejecting shell metacharacters that could escape
+# the RUN line in the generated Dockerfile.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9._@/+=:~<>!^*-]{1,256}$")
+_PACKAGE_MANAGERS = ("apt", "pip", "npm", "cargo", "gem", "go")
+_MAX_PACKAGES_PER_MANAGER = 256
+
+
+class EnvironmentPackages(BaseModel):
+    """Per-package-manager pre-install lists (v0.2.0 item #3).
+
+    The lists are stored on the environment and baked into a derived
+    Docker image at session boot. Identical package sets share a cached
+    image keyed by content hash, so the first session for a given
+    environment pays the install cost once and every later session in
+    that environment reuses the layer.
+
+    Empty lists are the default; ``derived_image_tag()`` returns ``None``
+    in that case and sessions run against the unmodified base image.
+    """
+
+    apt: list[str] = Field(default_factory=list)
+    pip: list[str] = Field(default_factory=list)
+    npm: list[str] = Field(default_factory=list)
+    cargo: list[str] = Field(default_factory=list)
+    gem: list[str] = Field(default_factory=list)
+    go: list[str] = Field(default_factory=list)
+
+    @field_validator("apt", "pip", "npm", "cargo", "gem", "go")
+    @classmethod
+    def _validate_package_list(cls, v: list[str]) -> list[str]:
+        if len(v) > _MAX_PACKAGES_PER_MANAGER:
+            raise ValueError(
+                f"too many packages: max {_MAX_PACKAGES_PER_MANAGER} per manager"
+            )
+        seen: set[str] = set()
+        for entry in v:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError("package names must be non-empty strings")
+            if entry != entry.strip():
+                raise ValueError(
+                    f"package name {entry!r} has leading/trailing whitespace"
+                )
+            if not _PACKAGE_NAME_RE.match(entry):
+                raise ValueError(
+                    f"invalid package name {entry!r}: must match "
+                    f"{_PACKAGE_NAME_RE.pattern}"
+                )
+            if entry in seen:
+                raise ValueError(f"duplicate package {entry!r} in list")
+            seen.add(entry)
+        return v
+
+    def is_empty(self) -> bool:
+        return not any(getattr(self, mgr) for mgr in _PACKAGE_MANAGERS)
+
+    def normalized(self) -> dict[str, list[str]]:
+        """Order-independent representation for hashing.
+
+        Sorts each manager's list so callers that submit packages in
+        different orders share the same derived image.
+        """
+        return {mgr: sorted(getattr(self, mgr)) for mgr in _PACKAGE_MANAGERS}
+
+    def content_hash(self) -> str:
+        """Stable sha256 of the normalized package set."""
+        payload = json.dumps(self.normalized(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def derived_image_tag(
+    packages: EnvironmentPackages | None, *, repo: str = "linchpinhq/sandbox-env"
+) -> str | None:
+    """Return the tag of the derived image for *packages*, or None.
+
+    ``None`` means "no packages requested — use the base image directly."
+    Tags are 12 hex chars of the content hash, enough collision-resistance
+    for tens of millions of distinct environments.
+    """
+    if packages is None or packages.is_empty():
+        return None
+    return f"{repo}:{packages.content_hash()[:12]}"
+
+
 class EnvironmentConfig(BaseModel):
     """Environment configuration wrapper."""
 
     networking: NetworkingConfig
+    packages: EnvironmentPackages = Field(default_factory=EnvironmentPackages)  # v0.2.0 item #3
 
 
 class Environment(BaseModel):

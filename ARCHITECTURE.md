@@ -69,6 +69,10 @@ The startup hook in `linchpin-api` pre-creates two Docker networks:
 
 Each session container is attached to one of these based on its environment config.
 
+### Sandbox image — base + derived (v0.2.0 item #3)
+
+Every session boots from the baked image `linchpinhq/sandbox:v0.2.0` (Python 3.13, Node 20, Go 1.22, Rust 1.77, Java 21, Ruby 3.3, PHP 8.4, GCC 13, plus `psql`/`redis-cli`/`rg`/`tree`/`htop`). Environments can additionally declare a `packages` block listing pre-installs across six managers — `apt`, `pip`, `npm`, `cargo`, `gem`, `go`. When a session boots, `DockerSandbox.ensure_image` hashes the normalized package set, derives a tag (`linchpinhq/sandbox-env:<sha12>`), and builds the image on top of the base if it isn't already cached. Identical package sets across environments collapse to one image — first session pays the install cost, every later session in any same-packages env reuses the layer. Empty `packages` skips the build entirely.
+
 ## Session state machine
 
 ```mermaid

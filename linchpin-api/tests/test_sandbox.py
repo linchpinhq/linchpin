@@ -430,3 +430,179 @@ class TestEnsureDockerNetworks:
 
         with pytest.raises(SandboxError, match="Failed to create Docker network"):
             await ensure_docker_networks(client=client)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 item #3 — ensure_image / derived images
+# ---------------------------------------------------------------------------
+
+class TestEnsureImage:
+    @pytest.mark.asyncio
+    async def test_empty_packages_returns_base_image(self):
+        """No packages requested → no build, base_image returned as-is."""
+        from app.models import EnvironmentPackages
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        result = await sandbox.ensure_image(
+            base_image="linchpinhq/sandbox:v0.2.0",
+            packages=EnvironmentPackages(),
+        )
+
+        assert result == "linchpinhq/sandbox:v0.2.0"
+        client.images.get.assert_not_called()
+        client.images.build.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_packages_returns_base_image(self):
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        result = await sandbox.ensure_image(
+            base_image="linchpinhq/sandbox:v0.2.0",
+            packages=None,
+        )
+
+        assert result == "linchpinhq/sandbox:v0.2.0"
+        client.images.build.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_cached_image_without_rebuild(self):
+        """If the derived image already exists locally, no build happens."""
+        from app.models import EnvironmentPackages, derived_image_tag
+        client = _mock_client()
+        # images.get succeeds → cached
+        client.images.get.return_value = MagicMock()
+        sandbox = DockerSandbox(client=client)
+
+        packages = EnvironmentPackages(apt=["jq"])
+        result = await sandbox.ensure_image(
+            base_image="linchpinhq/sandbox:v0.2.0",
+            packages=packages,
+        )
+
+        assert result == derived_image_tag(packages)
+        client.images.get.assert_called_once()
+        client.images.build.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_builds_image_when_missing(self):
+        """First call with a fresh package set triggers a build."""
+        from docker.errors import ImageNotFound
+        from app.models import EnvironmentPackages, derived_image_tag
+        client = _mock_client()
+        client.images.get.side_effect = ImageNotFound("not cached yet")
+        sandbox = DockerSandbox(client=client)
+
+        packages = EnvironmentPackages(apt=["jq", "tree"], pip=["httpx"])
+        expected_tag = derived_image_tag(packages)
+        result = await sandbox.ensure_image(
+            base_image="linchpinhq/sandbox:v0.2.0",
+            packages=packages,
+        )
+
+        assert result == expected_tag
+        client.images.build.assert_called_once()
+        kwargs = client.images.build.call_args.kwargs
+        assert kwargs["tag"] == expected_tag
+        # Single-file Dockerfile context, no COPY/ADD
+        rendered = kwargs["fileobj"].getvalue().decode("utf-8")
+        assert rendered.startswith("FROM linchpinhq/sandbox:v0.2.0")
+        assert "apt-get install -y --no-install-recommends jq tree" in rendered
+        assert "pip install" in rendered and "httpx" in rendered
+
+    @pytest.mark.asyncio
+    async def test_build_failure_raises_sandbox_error(self):
+        from docker.errors import BuildError, ImageNotFound
+        from app.models import EnvironmentPackages
+        client = _mock_client()
+        client.images.get.side_effect = ImageNotFound("not cached")
+        client.images.build.side_effect = BuildError(reason="apt failed", build_log=[])
+        sandbox = DockerSandbox(client=client)
+
+        packages = EnvironmentPackages(apt=["nonexistent-package-xyz"])
+
+        with pytest.raises(SandboxError, match="Failed to build derived image"):
+            await sandbox.ensure_image(
+                base_image="linchpinhq/sandbox:v0.2.0",
+                packages=packages,
+            )
+
+
+class TestGenerateDockerfile:
+    """v0.2.0 item #3 — Dockerfile rendering is the security boundary
+    between caller-supplied package names and the build shell."""
+
+    def test_starts_with_from(self):
+        from app.models import EnvironmentPackages
+        df = DockerSandbox._generate_dockerfile(
+            "linchpinhq/sandbox:v0.2.0", EnvironmentPackages(apt=["jq"])
+        )
+        assert df.splitlines()[0] == "FROM linchpinhq/sandbox:v0.2.0"
+
+    def test_omits_runs_for_empty_managers(self):
+        from app.models import EnvironmentPackages
+        df = DockerSandbox._generate_dockerfile(
+            "base", EnvironmentPackages(pip=["httpx"])
+        )
+        assert "pip install" in df
+        assert "apt-get install" not in df
+        assert "npm install" not in df
+        assert "cargo install" not in df
+        assert "gem install" not in df
+        assert "go install" not in df
+
+    def test_one_run_per_go_package(self):
+        from app.models import EnvironmentPackages
+        df = DockerSandbox._generate_dockerfile(
+            "base",
+            EnvironmentPackages(go=["github.com/a/b@v1", "github.com/c/d@v2"]),
+        )
+        assert df.count("go install") == 2
+
+    def test_pip_uses_break_system_packages_for_pep_668(self):
+        from app.models import EnvironmentPackages
+        df = DockerSandbox._generate_dockerfile(
+            "base", EnvironmentPackages(pip=["httpx"])
+        )
+        assert "--break-system-packages" in df
+
+    def test_apt_includes_list_cleanup(self):
+        """Cleanup is non-negotiable — keeps the derived image lean."""
+        from app.models import EnvironmentPackages
+        df = DockerSandbox._generate_dockerfile(
+            "base", EnvironmentPackages(apt=["jq"])
+        )
+        assert "rm -rf /var/lib/apt/lists/*" in df
+
+
+class TestDerivedImageTag:
+    """v0.2.0 item #3 — image-tag hashing must be deterministic and
+    order-independent so that two environments declaring the same packages
+    share one image."""
+
+    def test_empty_returns_none(self):
+        from app.models import EnvironmentPackages, derived_image_tag
+        assert derived_image_tag(EnvironmentPackages()) is None
+        assert derived_image_tag(None) is None
+
+    def test_order_independent(self):
+        from app.models import EnvironmentPackages, derived_image_tag
+        a = EnvironmentPackages(apt=["jq", "tree"], pip=["httpx", "rich"])
+        b = EnvironmentPackages(apt=["tree", "jq"], pip=["rich", "httpx"])
+        assert derived_image_tag(a) == derived_image_tag(b)
+
+    def test_different_managers_yield_different_tags(self):
+        from app.models import EnvironmentPackages, derived_image_tag
+        a = EnvironmentPackages(apt=["jq"])
+        b = EnvironmentPackages(pip=["jq"])  # same name, different manager
+        assert derived_image_tag(a) != derived_image_tag(b)
+
+    def test_tag_format_is_repo_colon_12hex(self):
+        from app.models import EnvironmentPackages, derived_image_tag
+        tag = derived_image_tag(EnvironmentPackages(apt=["jq"]))
+        assert tag is not None
+        repo, hex_part = tag.split(":")
+        assert repo == "linchpinhq/sandbox-env"
+        assert len(hex_part) == 12
+        assert all(c in "0123456789abcdef" for c in hex_part)

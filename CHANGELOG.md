@@ -6,6 +6,7 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 ### Added
 
+- **Environment packages (v0.2.0 item #3).** `EnvironmentConfig.packages` accepts pre-install lists for six package managers — `apt`, `pip`, `npm`, `cargo`, `gem`, `go`. At session boot, the API builds a content-hashed derived sandbox image (`linchpinhq/sandbox-env:<sha12>`) on top of the base image. Identical package sets across environments share a single cached image, so only the first session pays the install cost. Empty `packages` falls through to the base image at no cost. Package names are validated against a conservative regex to keep them out of shell-metacharacter territory; per-manager cap is 256 packages.
 - **Files API (v0.2.0 PR1 — items #1/#2 prep).** `POST /v1/files` (multipart upload), `GET /v1/files` (scope-filtered, paginated), `GET /v1/files/{id}`, `GET /v1/files/{id}/content` (streams; 403 unless `downloadable`), `DELETE /v1/files/{id}`. Content-addressable local-fs `FileStore` deduplicates identical uploads by sha256. Per-file size cap via `LINCHPIN_FILES_MAX_BYTES` (default 500 MB). Storage root via `LINCHPIN_FILES_ROOT` (default `/var/lib/linchpin/files`).
 - New `files` table and indexes (Alembic `0003_files`).
 
