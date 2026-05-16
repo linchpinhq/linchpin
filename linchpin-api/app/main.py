@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Linchpin API",
-    version="0.1.0",
+    version="0.2.0",
     description="Self-hostable runtime for managed AI agents",
     lifespan=lifespan,
 )
