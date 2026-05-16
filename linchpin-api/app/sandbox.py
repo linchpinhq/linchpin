@@ -424,9 +424,12 @@ async def ensure_docker_networks(
 ) -> None:
     """Pre-create the linchpin Docker networks if they don't already exist.
 
-    Creates two networks:
+    Creates three networks:
     - ``linchpin-none``: internal bridge network (no external access)
     - ``linchpin-open``: bridge network (unrestricted external access)
+    - ``linchpin-limited``: internal bridge network (v0.2.0 item #4 —
+      surface for limited mode; v0.2.0 enforces same denial as `none`,
+      v0.2.x adds the egress proxy that honors per-env allowlists).
 
     Idempotent — silently skips networks that already exist.
 
@@ -434,9 +437,14 @@ async def ensure_docker_networks(
     """
     _client = client or docker.from_env()
 
+    # v0.2.0 item #4 — `linchpin-limited` lands here so the bridge exists
+    # by the time the first limited-mode session boots. For v0.2.0 it's an
+    # internal bridge (same denial level as `linchpin-none`); v0.2.x adds
+    # the egress proxy that consults each env's allowlist on the wire.
     networks = [
         {"name": "linchpin-none", "driver": "bridge", "internal": True},
         {"name": "linchpin-open", "driver": "bridge", "internal": False},
+        {"name": "linchpin-limited", "driver": "bridge", "internal": True},
     ]
 
     for net in networks:

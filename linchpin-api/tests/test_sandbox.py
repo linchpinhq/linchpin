@@ -363,12 +363,12 @@ from app.sandbox import ensure_docker_networks
 
 class TestEnsureDockerNetworks:
     @pytest.mark.asyncio
-    async def test_creates_both_networks(self):
+    async def test_creates_all_networks(self):
         client = _mock_client()
 
         await ensure_docker_networks(client=client)
 
-        assert client.networks.create.call_count == 2
+        assert client.networks.create.call_count == 3
         calls = client.networks.create.call_args_list
 
         # First call: linchpin-none (internal)
@@ -383,12 +383,18 @@ class TestEnsureDockerNetworks:
         assert calls[1].kwargs["internal"] is False
         assert calls[1].kwargs["check_duplicate"] is True
 
+        # Third call: linchpin-limited (internal in v0.2.0 — proxy in v0.2.x)
+        assert calls[2].args[0] == "linchpin-limited"
+        assert calls[2].kwargs["driver"] == "bridge"
+        assert calls[2].kwargs["internal"] is True
+        assert calls[2].kwargs["check_duplicate"] is True
+
     @pytest.mark.asyncio
     async def test_skips_existing_networks(self):
         from docker.errors import APIError
 
         client = _mock_client()
-        # Both networks already exist — 409 Conflict
+        # All networks already exist — 409 Conflict
         resp = MagicMock()
         resp.status_code = 409
         client.networks.create.side_effect = APIError(
@@ -397,10 +403,10 @@ class TestEnsureDockerNetworks:
 
         # Should not raise
         await ensure_docker_networks(client=client)
-        assert client.networks.create.call_count == 2
+        assert client.networks.create.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_skips_first_creates_second(self):
+    async def test_skips_first_creates_rest(self):
         from docker.errors import APIError
 
         client = _mock_client()
@@ -408,14 +414,15 @@ class TestEnsureDockerNetworks:
         resp.status_code = 409
         network_mock = MagicMock()
 
-        # First network exists, second is new
+        # First network exists, other two are new
         client.networks.create.side_effect = [
             APIError("Conflict", response=resp, explanation="already exists"),
+            network_mock,
             network_mock,
         ]
 
         await ensure_docker_networks(client=client)
-        assert client.networks.create.call_count == 2
+        assert client.networks.create.call_count == 3
 
     @pytest.mark.asyncio
     async def test_raises_sandbox_error_on_api_error(self):

@@ -183,10 +183,95 @@ class AgentVersion(BaseModel):
 # Environment
 # ---------------------------------------------------------------------------
 
-class NetworkingConfig(BaseModel):
-    """Container networking configuration."""
+# Hostname / IP literal validator for `limited` networking allowlists.
+# RFC-1123 (no leading hyphen, no trailing dot) plus a permissive nod to
+# IPv4 / IPv6 literals. Wildcards like `*.example.com` are admitted — the
+# proxy that lands in v0.2.x will interpret them.
+_ALLOWED_HOST_RE = re.compile(
+    r"^(?:\*\.)?(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])"
+    r"(?:\.(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]))*$"
+)
+_ALLOWED_IPV4_RE = re.compile(
+    r"^(?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3}$"
+)
+_MAX_ALLOWED_HOSTS = 256
 
-    type: Literal["none", "unrestricted"]
+
+class NoneNetworking(BaseModel):
+    """No external network access. Equivalent to the v0.1 `none` mode."""
+
+    type: Literal["none"] = "none"
+
+
+class UnrestrictedNetworking(BaseModel):
+    """Full external network access. Equivalent to the v0.1 `unrestricted` mode."""
+
+    type: Literal["unrestricted"] = "unrestricted"
+
+
+class LimitedNetworking(BaseModel):
+    """Restricted external network access with an explicit allowlist
+    (v0.2.0 item #4).
+
+    The shape matches Anthropic's `limited` mode so SDKs cross-port. In
+    v0.2.0 only the surface is shipped — the session container attaches
+    to an internal bridge network (same denial level as `none`) and the
+    allowlist fields are persisted but not yet enforced. The egress
+    proxy that turns the allowlist into actual permitted traffic lands
+    in v0.2.x, mirroring the v0.1 → v0.2 PR4 split (eng-review D1).
+    """
+
+    type: Literal["limited"] = "limited"
+    allowed_hosts: list[str] = Field(default_factory=list)
+    allow_mcp_servers: bool = False
+    allow_package_managers: bool = False
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, v: list[str]) -> list[str]:
+        if len(v) > _MAX_ALLOWED_HOSTS:
+            raise ValueError(
+                f"too many allowed_hosts: max {_MAX_ALLOWED_HOSTS}"
+            )
+        seen: set[str] = set()
+        for host in v:
+            if not isinstance(host, str) or not host:
+                raise ValueError("allowed_hosts entries must be non-empty strings")
+            if host != host.strip():
+                raise ValueError(
+                    f"allowed_hosts entry {host!r} has leading/trailing whitespace"
+                )
+            if len(host) > 253:
+                raise ValueError(
+                    f"allowed_hosts entry {host!r} exceeds 253 chars"
+                )
+            if "/" in host or " " in host or ":" in host:
+                # No URL/scheme/port — just the host, please.
+                raise ValueError(
+                    f"allowed_hosts entry {host!r} contains a forbidden "
+                    "character (slash/space/colon). Provide a hostname or "
+                    "IPv4 literal only — no scheme, no path, no port."
+                )
+            if not (_ALLOWED_HOST_RE.match(host) or _ALLOWED_IPV4_RE.match(host)):
+                raise ValueError(
+                    f"allowed_hosts entry {host!r} is not a valid hostname "
+                    "or IPv4 literal"
+                )
+            if host in seen:
+                raise ValueError(f"duplicate allowed_hosts entry {host!r}")
+            seen.add(host)
+        return v
+
+
+# Discriminated union — v0.2.0 item #4 widens NetworkingConfig from a
+# plain class to a discriminator over three modes. Existing v0.1 payloads
+# (`{"type": "none"}` / `{"type": "unrestricted"}`) parse unchanged.
+NetworkingConfig = Annotated[
+    Annotated[NoneNetworking, Tag("none")]
+    | Annotated[UnrestrictedNetworking, Tag("unrestricted")]
+    | Annotated[LimitedNetworking, Tag("limited")],
+    Discriminator("type"),
+]
 
 
 # Package names use a conservative allowlist that admits every form we care

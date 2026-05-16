@@ -199,6 +199,42 @@ def test_create_session_none_network(mock_fetch, sandbox_client):
 
 
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_limited_network(mock_fetch, sandbox_client):
+    """v0.2.0 item #4 — limited mode routes to linchpin-limited network."""
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+
+    agent_row = _make_agent_row(agent_id=agent_id)
+    # Bypass _make_env_row's simple net_type since limited needs sub-fields.
+    env_row = {
+        "id": uuid.UUID(env_id),
+        "name": "limited-env",
+        "config": {
+            "networking": {
+                "type": "limited",
+                "allowed_hosts": ["api.github.com"],
+                "allow_mcp_servers": True,
+                "allow_package_managers": False,
+            },
+        },
+        "created_at": datetime(2026, 5, 15, tzinfo=timezone.utc),
+        "archived_at": None,
+    }
+    session_row = _make_session_row(agent_id=agent_id, environment_id=env_id)
+
+    mock_fetch.side_effect = [agent_row, env_row, session_row]
+
+    payload = {"agent_id": agent_id, "environment_id": env_id}
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201
+    args, kwargs = mock_sandbox.create.call_args
+    from app.sandbox import DEFAULT_BASE_IMAGE
+    assert args == (DEFAULT_BASE_IMAGE, "linchpin-limited")
+
+
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
 def test_create_session_agent_not_found(mock_fetch, sandbox_client):
     """Session creation with non-existent agent returns 404."""
     client, _ = sandbox_client
