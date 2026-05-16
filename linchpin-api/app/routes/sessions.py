@@ -270,7 +270,13 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     metadata_json = json.dumps(body.metadata)
     vault_ids_json = json.dumps(body.vault_ids)
     stats_json = json.dumps({"total_events": 0, "tool_calls": 0, "model_turns": 0})
-    usage_json = json.dumps({"input_tokens": 0, "output_tokens": 0})
+    # v0.2.0 item #10 — prompt-cache counters seeded alongside the existing two.
+    usage_json = json.dumps({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    })
 
     row = await fetch_one(
         """

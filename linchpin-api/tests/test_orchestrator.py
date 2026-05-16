@@ -75,7 +75,7 @@ def _make_session_row(status="idle"):
         "last_event_cursor": None,
         "ttl_seconds": None,
         "stats": {"total_events": 0, "tool_calls": 0, "model_turns": 0},
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
     }
 
 
@@ -261,7 +261,7 @@ class TestRunSessionTextResponse:
         text_response = ModelResponse(
             content=[ContentBlock(type="text", text="Hello!")],
             stop_reason="end_turn",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -360,7 +360,7 @@ class TestRunSessionToolUseAlwaysAllow:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -437,7 +437,7 @@ class TestRunSessionToolUseAlwaysAsk:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -508,7 +508,7 @@ class TestRunSessionToolUseDenied:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -572,7 +572,7 @@ class TestRunSessionThinking:
                 ContentBlock(type="text", text="Here's my answer."),
             ],
             stop_reason="end_turn",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -672,7 +672,7 @@ class TestRunSessionToolConfirmationDenied:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1090,7 +1090,7 @@ class TestRunSessionMCPToolUse:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1163,7 +1163,7 @@ class TestRunSessionCustomToolUse:
                 ),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1416,7 +1416,7 @@ class TestRunSessionInterrupt:
                 ContentBlock(type="tool_use", tool_use_id="tu2", tool_name="bash", tool_input={"command": "pwd"}),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1500,7 +1500,7 @@ class TestToolConfirmationFlowAllow:
                 ContentBlock(type="tool_use", tool_use_id="tu1", tool_name="bash", tool_input={"command": "ls"}),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1573,7 +1573,7 @@ class TestToolConfirmationFlowDeny:
                 ContentBlock(type="tool_use", tool_use_id="tu1", tool_name="bash", tool_input={"command": "rm -rf /"}),
             ],
             stop_reason="tool_use",
-            usage={"input_tokens": 10, "output_tokens": 5},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         )
 
         mock_provider = AsyncMock()
@@ -1995,3 +1995,59 @@ class TestRecoverSessions:
         # Dead session should be failed without orchestrator task
         assert (dead_sid, "failed") in transitions
         assert dead_sid not in orchestrator_tasks
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 item #10 — update_usage SQL composes all four counters
+# ---------------------------------------------------------------------------
+
+
+from app.orchestrator import update_usage  # noqa: E402
+
+
+class TestUpdateUsage:
+    @pytest.mark.asyncio
+    @patch("app.orchestrator.fetch_one", new_callable=AsyncMock)
+    async def test_all_four_counters_passed_as_params(self, mock_fetch):
+        sid = str(uuid.uuid4())
+        await update_usage(sid, {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 50,
+            "cache_read_input_tokens": 75,
+        })
+        assert mock_fetch.await_count == 1
+        sql = mock_fetch.await_args.args[0]
+        # All four jsonb_set keys appear in the composed UPDATE.
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            assert key in sql
+        # The four bind params come before the WHERE id, in declared order.
+        positional = list(mock_fetch.await_args.args[1:])
+        assert positional[:4] == [100, 20, 50, 75]
+
+    @pytest.mark.asyncio
+    @patch("app.orchestrator.fetch_one", new_callable=AsyncMock)
+    async def test_missing_keys_default_to_zero(self, mock_fetch):
+        """Providers without cache metrics (Ollama) pass a dict with no
+        cache_* keys. update_usage must default to 0 increments, not error."""
+        sid = str(uuid.uuid4())
+        await update_usage(sid, {"input_tokens": 5, "output_tokens": 3})
+        positional = list(mock_fetch.await_args.args[1:])
+        assert positional[:4] == [5, 3, 0, 0]
+
+    @pytest.mark.asyncio
+    @patch("app.orchestrator.fetch_one", new_callable=AsyncMock)
+    async def test_sql_handles_v01_rows_via_coalesce(self, mock_fetch):
+        """v0.1 sessions have usage JSONB without the cache_* keys.
+        COALESCE makes the UPDATE survive that case rather than erroring on
+        a NULL → int cast."""
+        sid = str(uuid.uuid4())
+        await update_usage(sid, {"input_tokens": 1, "output_tokens": 1})
+        sql = mock_fetch.await_args.args[0]
+        assert "COALESCE((usage->>'cache_creation_input_tokens')::int, 0)" in sql
+        assert "COALESCE((usage->>'cache_read_input_tokens')::int, 0)" in sql

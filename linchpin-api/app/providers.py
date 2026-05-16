@@ -49,7 +49,7 @@ class ModelResponse:
 
     content: list[ContentBlock] = field(default_factory=list)
     stop_reason: str | None = None
-    usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
 
 
 @dataclass
@@ -212,9 +212,20 @@ def _parse_openrouter_response(data: dict) -> ModelResponse:
     stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
 
     usage_raw = data.get("usage") or {}
+    # v0.2.0 item #10 — surface prompt-caching counters from the OpenRouter /
+    # OpenAI-style response when present. Anthropic exposes cache_creation /
+    # cache_read on `prompt_tokens_details.cached_tokens`; OpenRouter mirrors
+    # this for upstream providers that report it. Missing fields → 0.
+    prompt_details = usage_raw.get("prompt_tokens_details") or {}
+    cache_read = prompt_details.get("cached_tokens", 0) or 0
+    # Anthropic-via-OpenRouter exposes cache *creation* under cache_creation_input_tokens
+    # at the top level; OpenAI doesn't have a cache-creation concept.
+    cache_creation = usage_raw.get("cache_creation_input_tokens", 0) or 0
     usage = {
         "input_tokens": usage_raw.get("prompt_tokens", 0) or 0,
         "output_tokens": usage_raw.get("completion_tokens", 0) or 0,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
     }
 
     return ModelResponse(content=blocks, stop_reason=stop_reason, usage=usage)
@@ -354,9 +365,13 @@ class OpenRouterProvider:
 
                 if chunk.get("usage"):
                     u = chunk["usage"]
+                    # v0.2.0 item #10 — see provider.send() above for mapping.
+                    prompt_details = u.get("prompt_tokens_details") or {}
                     usage = {
                         "input_tokens": u.get("prompt_tokens", 0) or 0,
                         "output_tokens": u.get("completion_tokens", 0) or 0,
+                        "cache_creation_input_tokens": u.get("cache_creation_input_tokens", 0) or 0,
+                        "cache_read_input_tokens": prompt_details.get("cached_tokens", 0) or 0,
                     }
 
                 choices = chunk.get("choices") or []
@@ -405,7 +420,7 @@ class OpenRouterProvider:
                     yield StreamChunk(
                         type="final",
                         stop_reason=stop_reason,
-                        usage=usage or {"input_tokens": 0, "output_tokens": 0},
+                        usage=usage or {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
                     )
         finally:
             await resp.aclose()
@@ -437,7 +452,7 @@ def _parse_ollama_response(data: dict) -> ModelResponse:
     if msg.get("tool_calls"):
         stop_reason = "tool_use"
 
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    usage_data = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
     if "prompt_eval_count" in data:
         usage_data["input_tokens"] = data["prompt_eval_count"]
     if "eval_count" in data:
