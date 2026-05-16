@@ -413,13 +413,22 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
             "cache_read_input_tokens": 0,
         })
 
+        # v0.2.0 breaking bundle — pin the session to the wire-format
+        # version the caller used. NULL = v1 (no header sent). The events
+        # endpoint reads this column to keep an in-flight stream's shape
+        # consistent for the session's lifetime.
+        from app.api_version import V1
+        api_version = getattr(request.state, "api_version", V1)
+        pinned_version: str | None = None if api_version == V1 else api_version
+
         row = await fetch_one(
             """
             INSERT INTO sessions
                 (id, agent_id, agent_version, environment_id, status,
-                 container_id, title, metadata, ttl_seconds, vault_ids, stats, usage)
+                 container_id, title, metadata, ttl_seconds, vault_ids, stats, usage,
+                 linchpin_api_version)
             VALUES ($1, $2, $3, $4, 'running',
-                    $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, $11::jsonb)
+                    $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12)
             RETURNING *
             """,
             uuid.UUID(session_id),
@@ -433,6 +442,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
             vault_ids_json,
             stats_json,
             usage_json,
+            pinned_version,
         )
 
         # Persist session_resources rows. State is 'mounted' for resources whose

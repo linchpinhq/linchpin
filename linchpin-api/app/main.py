@@ -133,8 +133,28 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in cors_origins],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["Authorization"],
+    allow_headers=["Authorization", "Linchpin-API-Version"],
+    expose_headers=["Linchpin-API-Version", "Linchpin-Deprecation"],
 )
+
+
+# v0.2.0 breaking bundle — middleware that resolves the
+# `Linchpin-API-Version` header on every request, caches it on
+# request.state, and echoes the resolved version back on the response.
+# An unknown version short-circuits to 400 with the supported list,
+# matching the behavior negotiate() would produce from a dependency.
+@app.middleware("http")
+async def linchpin_api_version_middleware(request, call_next):  # type: ignore[no-untyped-def]
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    from app import api_version as _av
+    try:
+        version = _av.negotiate(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    response = await call_next(request)
+    _av.echo_version_header(response, version)
+    return response
 
 
 # Router for all /v1/ endpoints — auth required
