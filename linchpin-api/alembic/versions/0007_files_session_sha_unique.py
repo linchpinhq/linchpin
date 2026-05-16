@@ -1,7 +1,7 @@
 """Partial unique index on files(scope_id, sha256) for session deliverables (v0.2.0 PR5 follow-up).
 
-Revision ID: 0005
-Revises: 0004
+Revision ID: 0007
+Revises: 0006
 Create Date: 2026-05-15 00:00:00.000000
 
 The deliverables watcher (PR5) inserts files with
@@ -22,8 +22,8 @@ from typing import Sequence, Union
 from alembic import op
 
 
-revision: str = "0005"
-down_revision: Union[str, None] = "0004"
+revision: str = "0007"
+down_revision: Union[str, None] = "0006"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -429,10 +429,11 @@ def test_terminate_session(mock_fetch, mock_fetch_all, mock_execute, sandbox_cli
     )
 
 
+@patch("app.routes.sessions.execute", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
 def test_terminate_session_removes_outputs_dir(
-    mock_fetch, mock_fetch_all, sandbox_client, tmp_path, monkeypatch,
+    mock_fetch, mock_fetch_all, mock_execute, sandbox_client, tmp_path, monkeypatch,
 ):
     """Terminate wipes /mnt/session/outputs/<sid> on the host so the writable
     bind doesn't leak up to LINCHPIN_DELIVERABLES_PER_SESSION_CAP_BYTES of
@@ -462,10 +463,11 @@ def test_terminate_session_removes_outputs_dir(
     assert not session_dir.exists(), "outputs_dir should be removed on terminate"
 
 
+@patch("app.routes.sessions.execute", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
 def test_terminate_session_outputs_dir_already_gone(
-    mock_fetch, mock_fetch_all, sandbox_client, tmp_path, monkeypatch,
+    mock_fetch, mock_fetch_all, mock_execute, sandbox_client, tmp_path, monkeypatch,
 ):
     """Terminate is robust to the outputs directory never having been
     created (e.g., a session that crashed before the watcher boot scan)."""
