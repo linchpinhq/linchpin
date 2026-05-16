@@ -169,6 +169,7 @@ class Environment(BaseModel):
     name: str
     config: EnvironmentConfig
     created_at: datetime
+    archived_at: datetime | None = None  # v0.2.0 item #6
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +337,7 @@ class EnvironmentResponse(BaseModel):
     name: str
     config: EnvironmentConfig
     created_at: datetime
+    archived_at: datetime | None = None  # v0.2.0 item #6
 
 
 class SessionResponse(BaseModel):

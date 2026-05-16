@@ -22,6 +22,7 @@ def _make_env_row(
     env_id: str | None = None,
     name: str = "test-env",
     config: dict | None = None,
+    archived_at=None,
 ):
     """Build a fake asyncpg Record-like dict for an environment row."""
     return {
@@ -29,6 +30,7 @@ def _make_env_row(
         "name": name,
         "config": config or {"networking": {"type": "none"}},
         "created_at": datetime(2025, 1, 1, tzinfo=timezone.utc),
+        "archived_at": archived_at,
     }
 
 
@@ -173,6 +175,113 @@ def test_list_environments_empty(mock_fetch, client):
     assert body["has_more"] is False
 
 
+# ---- v0.2.0 item #6: archive + delete + list filter ----
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_archive_environment_sets_archived_at(mock_fetch, client):
+    """Happy path: POST .../archive flips a live env to archived."""
+    eid = str(uuid.uuid4())
+    archived_at = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    mock_fetch.side_effect = [
+        _make_env_row(env_id=eid),                            # existing lookup
+        _make_env_row(env_id=eid, archived_at=archived_at),   # UPDATE RETURNING *
+    ]
+    resp = client.post(f"/v1/environments/{eid}/archive", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["archived_at"] is not None
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_archive_environment_idempotent(mock_fetch, client):
+    """Archiving an already-archived env returns the same row without
+    re-stamping archived_at — single fetch_one call."""
+    eid = str(uuid.uuid4())
+    archived_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    mock_fetch.return_value = _make_env_row(env_id=eid, archived_at=archived_at)
+
+    resp = client.post(f"/v1/environments/{eid}/archive", headers=AUTH)
+    assert resp.status_code == 200
+    assert mock_fetch.await_count == 1, "must not issue UPDATE on already-archived env"
+    assert resp.json()["archived_at"] is not None
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_archive_environment_404_when_missing(mock_fetch, client):
+    mock_fetch.return_value = None
+    resp = client.post(f"/v1/environments/{uuid.uuid4()}/archive", headers=AUTH)
+    assert resp.status_code == 404
+
+
+def test_archive_environment_404_for_malformed_id(client):
+    resp = client.post("/v1/environments/not-a-uuid/archive", headers=AUTH)
+    assert resp.status_code == 404
+
+
+@patch("app.routes.environments.fetch_all", new_callable=AsyncMock)
+def test_list_environments_excludes_archived_by_default(mock_fetch_all, client):
+    """The list endpoint filters out archived envs unless include_archived=true.
+    We verify by inspecting the SQL the route ran."""
+    mock_fetch_all.return_value = []
+    resp = client.get("/v1/environments", headers=AUTH)
+    assert resp.status_code == 200
+    sql = mock_fetch_all.await_args.args[0]
+    assert "archived_at IS NULL" in sql, "default list must filter archived rows"
+
+
+@patch("app.routes.environments.fetch_all", new_callable=AsyncMock)
+def test_list_environments_include_archived_returns_all(mock_fetch_all, client):
+    mock_fetch_all.return_value = []
+    resp = client.get("/v1/environments?include_archived=true", headers=AUTH)
+    assert resp.status_code == 200
+    sql = mock_fetch_all.await_args.args[0]
+    assert "archived_at IS NULL" not in sql, "include_archived must drop the filter"
+
+
+@patch("app.routes.environments.execute", new_callable=AsyncMock)
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_delete_environment_removes_row(mock_fetch, mock_execute, client):
+    eid = str(uuid.uuid4())
+    # fetch_one order: existence check → in-use check returns None
+    mock_fetch.side_effect = [{"id": uuid.UUID(eid)}, None]
+
+    resp = client.delete(f"/v1/environments/{eid}", headers=AUTH)
+    assert resp.status_code == 204
+    mock_execute.assert_awaited_once()
+
+
+@patch("app.routes.environments.execute", new_callable=AsyncMock)
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_delete_environment_409_when_session_active(mock_fetch, mock_execute, client):
+    """Non-terminated sessions referencing this env block deletion."""
+    eid = str(uuid.uuid4())
+    sid = uuid.uuid4()
+    mock_fetch.side_effect = [
+        {"id": uuid.UUID(eid)},
+        {"id": sid, "status": "running"},
+    ]
+
+    resp = client.delete(f"/v1/environments/{eid}", headers=AUTH)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "environment_in_use"
+    assert detail["blocking_session_id"] == str(sid)
+    assert detail["blocking_session_status"] == "running"
+    mock_execute.assert_not_awaited()
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_delete_environment_404_when_missing(mock_fetch, client):
+    mock_fetch.return_value = None
+    resp = client.delete(f"/v1/environments/{uuid.uuid4()}", headers=AUTH)
+    assert resp.status_code == 404
+
+
+def test_delete_environment_404_for_malformed_id(client):
+    resp = client.delete("/v1/environments/not-a-uuid", headers=AUTH)
+    assert resp.status_code == 404
+
+
 # ---- Auth required ----
 
 
@@ -181,3 +290,5 @@ def test_environments_endpoints_require_auth(client):
     assert client.get("/v1/environments").status_code == 401
     assert client.get(f"/v1/environments/{uuid.uuid4()}").status_code == 401
     assert client.post("/v1/environments", json=VALID_PAYLOAD).status_code == 401
+    assert client.post(f"/v1/environments/{uuid.uuid4()}/archive").status_code == 401
+    assert client.delete(f"/v1/environments/{uuid.uuid4()}").status_code == 401
