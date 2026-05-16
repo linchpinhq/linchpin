@@ -70,6 +70,10 @@ The startup hook in `linchpin-api` pre-creates three Docker networks:
 
 Each session container is attached to one of these based on its environment config. `limited` mode also carries `allowed_hosts`, `allow_mcp_servers`, and `allow_package_managers` fields that are persisted on the environment for the v0.2.x egress proxy to consult.
 
+### Webhooks (v0.2.0 item #14)
+
+Outbound HTTP fan-out for session lifecycle + vault credential events. Endpoints registered via `POST /v1/webhook_endpoints` carry an `enabled_events[]` allowlist and an HMAC secret (`whsec_<base64-32>`). When `append_event` records a matching event, the API inserts one `webhook_deliveries` row per registered endpoint; a per-process background worker (`delivery_worker_loop`) polls due rows under `FOR UPDATE SKIP LOCKED`, POSTs them with a `Linchpin-Signature: t=<ts>,v1=<hex>` header (HMAC-SHA256 over `f"{ts}.{payload}"`), and either marks the delivery succeeded or schedules an exponential-backoff retry up to 5 attempts before retiring as `exhausted`. `GET /v1/webhook_endpoints/{id}/deliveries` exposes the audit trail. Set `LINCHPIN_WEBHOOKS_WORKER=false` to skip the worker (used by tests; also useful for multi-process deployments running the worker out of band).
+
 ### Sandbox image — base + derived (v0.2.0 item #3)
 
 Every session boots from the baked image `linchpinhq/sandbox:v0.2.0` (Python 3.13, Node 20, Go 1.22, Rust 1.77, Java 21, Ruby 3.3, PHP 8.4, GCC 13, plus `psql`/`redis-cli`/`rg`/`tree`/`htop`). Environments can additionally declare a `packages` block listing pre-installs across six managers — `apt`, `pip`, `npm`, `cargo`, `gem`, `go`. When a session boots, `DockerSandbox.ensure_image` hashes the normalized package set, derives a tag (`linchpinhq/sandbox-env:<sha12>`), and builds the image on top of the base if it isn't already cached. Identical package sets across environments collapse to one image — first session pays the install cost, every later session in any same-packages env reuses the layer. Empty `packages` skips the build entirely.

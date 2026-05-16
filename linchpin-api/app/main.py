@@ -21,8 +21,10 @@ from app.routes.files import router as files_router
 from app.routes.session_resources import router as session_resources_router
 from app.routes.sessions import router as sessions_router
 from app.routes.vaults import router as vaults_router
+from app.routes.webhooks import router as webhooks_router
 from app.sandbox import DockerSandbox, ensure_docker_networks
 from app.watcher import watch_session_deliverables
+from app.webhooks import delivery_worker_loop, worker_enabled
 
 logger = logging.getLogger("linchpin-api")
 
@@ -69,6 +71,15 @@ async def lifespan(app: FastAPI):
     )
     app.state.ttl_cleanup_task = ttl_task
 
+    # v0.2.0 item #14 — webhook delivery worker. One per process; uses
+    # SELECT … FOR UPDATE SKIP LOCKED so multi-process deployments are
+    # safe out of the box. ``LINCHPIN_WEBHOOKS_WORKER=false`` skips it
+    # entirely (used by tests so the worker doesn't fire HTTP calls).
+    if worker_enabled():
+        app.state.webhook_worker_task = asyncio.create_task(delivery_worker_loop())
+    else:
+        app.state.webhook_worker_task = None
+
     # Recover non-terminal sessions. PR5 — pass watcher_tasks + the
     # watcher spawner so any session with a surviving container gets its
     # deliverables watcher (and the boot scan inside it) re-attached.
@@ -100,6 +111,15 @@ async def lifespan(app: FastAPI):
         await ttl_task
     except asyncio.CancelledError:
         pass
+
+    # Cancel webhook delivery worker if running
+    wht = getattr(app.state, "webhook_worker_task", None)
+    if wht is not None:
+        wht.cancel()
+        try:
+            await wht
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # Cancel any in-flight deliverables-watcher tasks (PR5). Boot scan on
     # the next start re-ingests anything written between now and restart.
@@ -166,6 +186,7 @@ v1_router.include_router(files_router)
 v1_router.include_router(sessions_router)
 v1_router.include_router(session_resources_router)
 v1_router.include_router(vaults_router)
+v1_router.include_router(webhooks_router)
 
 app.include_router(v1_router)
 

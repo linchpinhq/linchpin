@@ -72,6 +72,10 @@ def setup_mock_provider(mock_provider, response: ModelResponse | None = None, er
 def _set_api_key(monkeypatch: pytest.MonkeyPatch):
     """Ensure LINCHPIN_API_KEY is set for every test."""
     monkeypatch.setenv("LINCHPIN_API_KEY", "test-secret-key")
+    # v0.2.0 item #14 — skip the webhook delivery worker in tests so it
+    # doesn't try to POST anywhere. Individual tests that want to
+    # exercise the worker monkeypatch this back on.
+    monkeypatch.setenv("LINCHPIN_WEBHOOKS_WORKER", "false")
 
 
 @pytest.fixture()

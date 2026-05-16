@@ -966,3 +966,94 @@ class SessionResource(BaseModel):
     error: str | None = None
     created_at: datetime
     unmounted_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Webhooks (v0.2.0 item #14)
+# ---------------------------------------------------------------------------
+
+class WebhookEndpoint(BaseModel):
+    """Caller-registered HTTP destination for outbound events.
+
+    ``secret`` is returned in the POST /v1/webhook_endpoints response
+    only — subsequent reads omit it. Stripe's "you must save this now"
+    model; we don't store any way to retrieve it later. If lost, the
+    caller rotates by PATCH'ing with ``rotate_secret: true``.
+    """
+
+    id: str
+    url: str
+    enabled_events: list[str] = Field(default_factory=list)
+    description: str | None = None
+    enabled: bool = True
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    # secret is set ONLY on the POST response; absent on subsequent reads.
+    secret: str | None = None
+
+
+class CreateWebhookEndpointRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    enabled_events: list[str] = Field(default_factory=list)
+    description: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return v
+
+    @field_validator("enabled_events")
+    @classmethod
+    def _validate_enabled_events(cls, v: list[str]) -> list[str]:
+        from app.webhooks import WEBHOOK_RELEVANT_EVENTS
+        if len(v) > 64:
+            raise ValueError("enabled_events: max 64 entries")
+        unknown = [e for e in v if e not in WEBHOOK_RELEVANT_EVENTS]
+        if unknown:
+            raise ValueError(
+                f"unknown event types: {unknown}. Supported: "
+                f"{sorted(WEBHOOK_RELEVANT_EVENTS)}"
+            )
+        if len(set(v)) != len(v):
+            raise ValueError("enabled_events: duplicates not allowed")
+        return v
+
+
+class UpdateWebhookEndpointRequest(BaseModel):
+    url: str | None = None
+    enabled_events: list[str] | None = None
+    description: str | None = None
+    enabled: bool | None = None
+    rotate_secret: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return v
+
+
+class WebhookDelivery(BaseModel):
+    """One delivery attempt record (success or in-flight retry).
+
+    Listed via ``GET /v1/webhook_endpoints/{id}/deliveries`` so operators
+    can audit why a downstream system missed an event.
+    """
+
+    id: str
+    endpoint_id: str
+    event_type: str
+    status: Literal["pending", "succeeded", "failed", "exhausted"]
+    attempts: int
+    last_attempt_at: datetime | None
+    last_status_code: int | None
+    last_error: str | None
+    next_attempt_at: datetime
+    created_at: datetime
+    completed_at: datetime | None
