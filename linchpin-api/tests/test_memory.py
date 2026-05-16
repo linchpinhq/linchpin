@@ -316,3 +316,229 @@ def test_precondition_failed_carries_expected_actual():
     assert exc.expected == "abc"
     assert exc.actual == "def"
     assert "precondition failed" in str(exc).lower()
+
+
+# ---------------------------------------------------------------------------
+# Memory versions + redact (PR2)
+# ---------------------------------------------------------------------------
+
+
+def _make_version_row(
+    *,
+    ver_id: uuid.UUID | None = None,
+    memory_id: uuid.UUID | None = None,
+    store_id: uuid.UUID | None = None,
+    seq: int = 1,
+    content_sha256: str | None = None,
+    size_bytes: int = 4,
+    storage_path: str = "ab/cd/abcdef",
+    author: str = "api",
+    action: str = "create",
+    redacted_at=None,
+    expires_at=None,
+):
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    return {
+        "id": ver_id or uuid.uuid4(),
+        "memory_id": memory_id or uuid.uuid4(),
+        "memory_store_id": store_id or uuid.uuid4(),
+        "seq": seq,
+        "content_sha256": content_sha256 or ("a" * 64),
+        "size_bytes": size_bytes,
+        "storage_path": storage_path,
+        "author": author,
+        "action": action,
+        "redacted_at": redacted_at,
+        "created_at": now,
+        "expires_at": expires_at or (now + timedelta(days=30)),
+    }
+
+
+@patch("app.routes.memory_versions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+def test_list_versions_filters_by_memory_id(mock_fetch_one, mock_fetch_all, client):
+    sid = uuid.uuid4()
+    mid = uuid.uuid4()
+    mock_fetch_one.return_value = {"id": sid}  # store exists
+    mock_fetch_all.return_value = [
+        _make_version_row(store_id=sid, memory_id=mid, seq=2),
+        _make_version_row(store_id=sid, memory_id=mid, seq=1),
+    ]
+    resp = client.get(
+        f"/v1/memory_stores/{sid}/memory_versions?memory_id={mid}",
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    rows = resp.json()["data"]
+    assert len(rows) == 2
+    # SQL filtered by memory_id — assert the parametrized query carried it
+    sql_call = mock_fetch_all.await_args
+    assert sql_call.args[1] == sid
+    assert sql_call.args[2] == mid
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+def test_get_version_returns_metadata(mock_fetch, client):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    # Two fetch_one calls: store-exists check, then version row
+    mock_fetch.side_effect = [
+        {"id": sid},
+        _make_version_row(ver_id=vid, store_id=sid),
+    ]
+    resp = client.get(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}",
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["id"] == str(vid)
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+def test_get_version_content_404_when_redacted(mock_fetch, client):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    mock_fetch.side_effect = [
+        {"id": sid},
+        _make_version_row(ver_id=vid, store_id=sid, redacted_at=now),
+    ]
+    resp = client.get(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/content",
+        headers=AUTH,
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "redacted"
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+def test_get_version_content_204ish_for_delete_action(mock_fetch, client):
+    """Delete-action versions have empty storage_path → empty body, 200."""
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    mock_fetch.side_effect = [
+        {"id": sid},
+        _make_version_row(
+            ver_id=vid, store_id=sid, action="delete", storage_path=""
+        ),
+    ]
+    resp = client.get(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/content",
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert resp.content == b""
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+@patch("app.routes.memory_versions.execute", new_callable=AsyncMock)
+@patch("app.routes.memory_versions.LocalFileStore")
+def test_redact_zeros_and_unlinks(
+    mock_filestore_cls, mock_execute, mock_fetch, client
+):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    mid = uuid.uuid4()
+    target_row = _make_version_row(
+        ver_id=vid, store_id=sid, memory_id=mid, seq=3, storage_path="aa/bb/aabb"
+    )
+    redacted_row = dict(target_row)
+    redacted_row["redacted_at"] = datetime(2026, 5, 16, tzinfo=timezone.utc)
+    redacted_row["storage_path"] = ""
+    redacted_row["content_sha256"] = "0" * 64
+    redacted_row["size_bytes"] = 0
+    mock_fetch.side_effect = [
+        {"id": sid},          # store exists
+        target_row,           # original row
+        redacted_row,         # RETURNING *
+        {"max_seq": 3},       # head check — IS the head
+    ]
+    fs_inst = MagicMock()
+    fs_inst.delete = AsyncMock()
+    mock_filestore_cls.return_value = fs_inst
+
+    resp = client.post(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/redact",
+        json={"reason": "GDPR request"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["redacted_at"] is not None
+    assert body["content_sha256"] == "0" * 64
+    # FileStore.delete called with the original storage path
+    fs_inst.delete.assert_awaited_once_with("aa/bb/aabb")
+    # Two execute()s happened: the new redact version + memory soft-delete
+    assert mock_execute.await_count == 2
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+@patch("app.routes.memory_versions.execute", new_callable=AsyncMock)
+@patch("app.routes.memory_versions.LocalFileStore")
+def test_redact_non_head_does_not_advance_head(
+    mock_filestore_cls, mock_execute, mock_fetch, client
+):
+    """Redacting an older version doesn't touch the head — no
+    advancing 'redact' row is written."""
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    mid = uuid.uuid4()
+    target_row = _make_version_row(
+        ver_id=vid, store_id=sid, memory_id=mid, seq=2, storage_path="aa/bb/old"
+    )
+    redacted_row = dict(target_row)
+    redacted_row["redacted_at"] = datetime(2026, 5, 16, tzinfo=timezone.utc)
+    redacted_row["storage_path"] = ""
+    redacted_row["content_sha256"] = "0" * 64
+    redacted_row["size_bytes"] = 0
+    mock_fetch.side_effect = [
+        {"id": sid},
+        target_row,
+        redacted_row,
+        {"max_seq": 5},       # head is 5; we just redacted seq=2
+    ]
+    fs_inst = MagicMock()
+    fs_inst.delete = AsyncMock()
+    mock_filestore_cls.return_value = fs_inst
+
+    resp = client.post(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/redact",
+        json={"reason": "old data"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    # No additional execute()s because head wasn't advanced
+    assert mock_execute.await_count == 0
+
+
+@patch("app.routes.memory_versions.fetch_one", new_callable=AsyncMock)
+def test_redact_idempotent_on_already_redacted(mock_fetch, client):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    mock_fetch.side_effect = [
+        {"id": sid},
+        _make_version_row(ver_id=vid, store_id=sid, redacted_at=now),
+    ]
+    resp = client.post(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/redact",
+        json={"reason": "second-time"},
+        headers=AUTH,
+    )
+    # Idempotent — no error
+    assert resp.status_code == 200
+    assert resp.json()["redacted_at"] is not None
+
+
+def test_memory_versions_endpoints_require_auth(client):
+    sid = uuid.uuid4()
+    vid = uuid.uuid4()
+    assert client.get(f"/v1/memory_stores/{sid}/memory_versions").status_code == 401
+    assert client.get(f"/v1/memory_stores/{sid}/memory_versions/{vid}").status_code == 401
+    assert client.get(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/content"
+    ).status_code == 401
+    assert client.post(
+        f"/v1/memory_stores/{sid}/memory_versions/{vid}/redact",
+        json={"reason": "x"},
+    ).status_code == 401
