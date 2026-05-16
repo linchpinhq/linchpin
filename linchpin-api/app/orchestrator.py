@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any, Literal
 
@@ -724,6 +725,26 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
             # Start in-memory stream for live delta delivery (no DB writes for deltas)
             await start_stream(session_id, message_id)
 
+            # v0.2.0 item #9 — span around the model request. We emit
+            # `span.model_request_start` before the streaming call begins and
+            # pair it with `span.model_request_end` after the stream
+            # completes (success OR failure). `span_id` lets clients pair the
+            # two events; `elapsed_ms` is filled in on end. Both emissions
+            # are best-effort — span failures must not abort the agent loop.
+            span_id = str(uuid.uuid4())
+            span_started_at = time.monotonic()
+            try:
+                await append_event(session_id, "span.model_request_start", {
+                    "span_id": span_id,
+                    "model": {
+                        "provider": agent.model.provider,
+                        "id": agent.model.id,
+                    },
+                })
+            except Exception:
+                logger.exception("failed to append span.model_request_start")
+
+            span_error: str | None = None
             try:
                 async for chunk in provider.send_streaming(
                     messages, agent.model, tools or None, api_key=resolved_api_key,
@@ -746,6 +767,24 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
                         stop_reason = chunk.stop_reason
                         usage = chunk.usage or usage
             except Exception as stream_exc:
+                span_error = str(stream_exc)
+                # Emit the span end on failure too so observability tools see
+                # paired start/end events for every request. The full exception
+                # is logged + surfaced via session.error below; we don't
+                # re-raise from the span emit.
+                try:
+                    await append_event(session_id, "span.model_request_end", {
+                        "span_id": span_id,
+                        "model": {
+                            "provider": agent.model.provider,
+                            "id": agent.model.id,
+                        },
+                        "model_usage": usage,
+                        "elapsed_ms": int((time.monotonic() - span_started_at) * 1000),
+                        "error": span_error,
+                    })
+                except Exception:
+                    logger.exception("failed to append span.model_request_end on failure")
                 # Clean up the in-memory stream
                 asyncio.create_task(finish_stream(session_id))
                 if deltas_emitted:
@@ -761,6 +800,23 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
 
             # Mark stream as done (cleanup happens after delay)
             asyncio.create_task(finish_stream(session_id))
+
+            # v0.2.0 item #9 — span end on the success path, paired with the
+            # start emit above by span_id. model_usage is the per-request
+            # usage from the final chunk (not the cumulative session total —
+            # that's tracked separately via update_usage).
+            try:
+                await append_event(session_id, "span.model_request_end", {
+                    "span_id": span_id,
+                    "model": {
+                        "provider": agent.model.provider,
+                        "id": agent.model.id,
+                    },
+                    "model_usage": usage,
+                    "elapsed_ms": int((time.monotonic() - span_started_at) * 1000),
+                })
+            except Exception:
+                logger.exception("failed to append span.model_request_end")
 
             # 8. Update usage stats
             await update_usage(session_id, usage)
