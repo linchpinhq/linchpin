@@ -1057,3 +1057,165 @@ class WebhookDelivery(BaseModel):
     next_attempt_at: datetime
     created_at: datetime
     completed_at: datetime | None
+
+
+# ---------------------------------------------------------------------------
+# Memory (v0.3.0)
+# ---------------------------------------------------------------------------
+
+# Path validation lives next to its constants so the regex can be reused
+# by both API routes and the sandbox watcher. RFC-3986-ish: starts with
+# '/', no '..', no '//', no trailing slash, total ≤4096 chars.
+_MEMORY_PATH_MAX = 4096
+_MEMORY_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_MEMORY_NAME_RESERVED = frozenset({"anthropic", "claude", "linchpin"})
+MEMORY_MAX_BYTES_PER_MEMORY = 102_400  # 100 KB — hardcoded; cannot raise at runtime
+
+
+def validate_memory_path(path: str) -> str:
+    """Return *path* if valid; raise ``ValueError`` otherwise.
+
+    Memory paths address an entry inside a store. The rules mirror what
+    the sandbox can safely materialize as a file path on disk:
+
+    - must start with ``/``
+    - must NOT end with ``/`` (paths are file-shaped, not directory-shaped)
+    - no ``..`` or empty segments (no ``//``)
+    - no NUL bytes
+    - ≤ 4096 chars total
+    """
+    if not isinstance(path, str):
+        raise ValueError("path must be a string")
+    if not path:
+        raise ValueError("path must not be empty")
+    if not path.startswith("/"):
+        raise ValueError(f"path {path!r} must start with '/'")
+    if path == "/" or path.endswith("/"):
+        raise ValueError(f"path {path!r} must not end with '/'")
+    if "\x00" in path:
+        raise ValueError("path must not contain NUL bytes")
+    if len(path) > _MEMORY_PATH_MAX:
+        raise ValueError(f"path length {len(path)} exceeds {_MEMORY_PATH_MAX}")
+    parts = path.split("/")
+    for p in parts[1:]:  # parts[0] is empty because of leading '/'
+        if p == "" or p == "..":
+            raise ValueError(f"path {path!r} contains '..' or empty segment")
+    return path
+
+
+class MemoryStore(BaseModel):
+    """Workspace-scoped persistent memory container.
+
+    A session attaches up to ``LINCHPIN_MEMORY_MAX_STORES_PER_SESSION``
+    memory stores via the ``resources[]`` framework. Mount path is
+    derived from ``name`` (``/mnt/memory/<name>/``), not caller-supplied.
+    """
+
+    id: str
+    name: str
+    description: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+
+
+class CreateMemoryStoreRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not _MEMORY_NAME_RE.match(v):
+            raise ValueError(
+                f"name {v!r} must be lowercase kebab-case "
+                "(letters, digits, hyphens; must start with letter or digit)"
+            )
+        if v in _MEMORY_NAME_RESERVED:
+            raise ValueError(f"name {v!r} is reserved")
+        return v
+
+
+class UpdateMemoryStoreRequest(BaseModel):
+    description: str | None = Field(default=None, max_length=1024)
+
+
+class ContentShaPrecondition(BaseModel):
+    """Optimistic-concurrency precondition for memory writes.
+
+    Semantics mirror HTTP ETag: ``sha256=None`` matches "must not exist"
+    (create-only); ``sha256=<hex>`` matches "current head sha must
+    equal". A mismatch returns 412 ``precondition_failed`` so callers
+    can re-read and retry their merge.
+    """
+
+    type: Literal["content_sha256"] = "content_sha256"
+    sha256: str | None = None
+
+
+class WriteMemoryRequest(BaseModel):
+    """POST / PATCH ``/v1/memory_stores/{id}/memories`` body.
+
+    ``content`` is base64-encoded bytes on the wire (Pydantic ``bytes``
+    field type decodes it). 100 KB hard cap is enforced at validation
+    time, before the bytes ever touch storage.
+    """
+
+    path: str
+    content: bytes
+    precondition: ContentShaPrecondition | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return validate_memory_path(v)
+
+    @field_validator("content")
+    @classmethod
+    def _enforce_cap(cls, v: bytes) -> bytes:
+        if len(v) > MEMORY_MAX_BYTES_PER_MEMORY:
+            raise ValueError(
+                f"content size {len(v)} exceeds cap {MEMORY_MAX_BYTES_PER_MEMORY}"
+            )
+        return v
+
+
+class Memory(BaseModel):
+    """A single path-addressed memory entry inside a store."""
+
+    id: str
+    memory_store_id: str
+    path: str
+    content_sha256: str
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
+
+
+MemoryVersionAction = Literal["create", "update", "delete", "redact"]
+
+
+class MemoryVersion(BaseModel):
+    """Immutable snapshot of a memory at a point in time.
+
+    Versions retain for ``LINCHPIN_MEMORY_VERSION_RETENTION_DAYS`` (30 by
+    default), then the GC pass tombstones them — the row remains for
+    audit but ``content_sha256`` becomes zeros and the bytes are
+    unlinked from the FileStore.
+    """
+
+    id: str
+    memory_id: str
+    memory_store_id: str
+    seq: int
+    content_sha256: str
+    size_bytes: int
+    author: str
+    action: MemoryVersionAction
+    redacted_at: datetime | None = None
+    created_at: datetime
+    expires_at: datetime
+
+
+class RedactRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1024)
