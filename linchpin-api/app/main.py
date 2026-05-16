@@ -22,6 +22,7 @@ from app.routes.session_resources import router as session_resources_router
 from app.routes.sessions import router as sessions_router
 from app.routes.vaults import router as vaults_router
 from app.sandbox import DockerSandbox, ensure_docker_networks
+from app.watcher import watch_session_deliverables
 
 logger = logging.getLogger("linchpin-api")
 
@@ -56,14 +57,27 @@ async def lifespan(app: FastAPI):
     # Track orchestrator async tasks per session so they can be cancelled
     app.state.orchestrator_tasks: dict[str, "asyncio.Task"] = {}
 
+    # Track deliverables-watcher tasks per session (PR5 D3). The dict is
+    # initialized here (not lazily in create_session) so recover_sessions
+    # can populate it for sessions that survived a process restart — that
+    # is the wiring that makes the D4 "boot scan on startup" claim true.
+    app.state.watcher_tasks: dict[str, "asyncio.Task"] = {}
+
     # Start background TTL cleanup task
     ttl_task = asyncio.create_task(
         cleanup_expired_sessions(app.state.sandbox, app.state.orchestrator_tasks)
     )
     app.state.ttl_cleanup_task = ttl_task
 
-    # Recover non-terminal sessions
-    await recover_sessions(app.state.sandbox, app.state.orchestrator_tasks)
+    # Recover non-terminal sessions. PR5 — pass watcher_tasks + the
+    # watcher spawner so any session with a surviving container gets its
+    # deliverables watcher (and the boot scan inside it) re-attached.
+    await recover_sessions(
+        app.state.sandbox,
+        app.state.orchestrator_tasks,
+        watcher_tasks=app.state.watcher_tasks,
+        spawn_watcher=watch_session_deliverables,
+    )
 
     # Validate VAULT_ENCRYPTION_KEY early (warn, don't crash — key only
     # required when vault features are actually used)
@@ -86,6 +100,18 @@ async def lifespan(app: FastAPI):
         await ttl_task
     except asyncio.CancelledError:
         pass
+
+    # Cancel any in-flight deliverables-watcher tasks (PR5). Boot scan on
+    # the next start re-ingests anything written between now and restart.
+    for sid, w in list(app.state.watcher_tasks.items()):
+        if not w.done():
+            w.cancel()
+    for sid, w in list(app.state.watcher_tasks.items()):
+        try:
+            await w
+        except (asyncio.CancelledError, Exception):
+            pass
+    app.state.watcher_tasks.clear()
 
     # Close database connection pool
     await close_pool()

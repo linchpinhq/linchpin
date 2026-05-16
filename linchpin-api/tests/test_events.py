@@ -5,6 +5,7 @@ Validates: Requirements 7.3, 8.1, 8.2, 8.3, 8.4
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -12,7 +13,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.events import append_event, decode_cursor, encode_cursor, get_events
+from app import events as events_mod
+from app.events import (
+    append_event,
+    decode_cursor,
+    encode_cursor,
+    get_events,
+    release_session_event_lock,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +164,117 @@ class TestAppendEvent:
         update_call = mock_fetch.call_args_list[2]
         update_query = update_call[0][0]
         assert "model_turns" in update_query
+
+
+class TestAppendEventConcurrency:
+    """Regression coverage for the per-session asyncio.Lock around
+    append_event. PR5 introduced a second concurrent writer (the
+    deliverables watcher) to the events table for the same session_id.
+    Without the lock, two coroutines could race between the
+    `SELECT MAX(seq)+1` and the INSERT, both compute the same seq, and
+    the loser would hit `UniqueViolationError` against the events
+    `PRIMARY KEY (session_id, seq)`. The lock serializes the pair so the
+    second writer reads the first writer's seq."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_appends_see_monotonic_seqs(self):
+        sid = str(uuid.uuid4())
+        # Drop any stale lock from previous tests in this module.
+        release_session_event_lock(sid)
+
+        # Live-MAX(seq) simulator: holds state across the two concurrent
+        # callers. The INSERT path asserts seq == state+1 so a missed
+        # SELECT/INSERT serialization shows up as an AssertionError, not a
+        # silent passing test.
+        state = {"seq": 0}
+        inserts: list[int] = []
+
+        async def fake_fetch_one(query, *args, **kwargs):
+            q = " ".join(query.split())
+            if "SELECT COALESCE(MAX(seq)" in q:
+                # Yield so the other coroutine has a chance to barge in.
+                await asyncio.sleep(0)
+                return {"next_seq": state["seq"] + 1}
+            if q.startswith("INSERT INTO events"):
+                seq = args[2]
+                assert seq == state["seq"] + 1, (
+                    f"non-monotonic seq: state={state['seq']} got={seq} "
+                    "— lock did not serialize SELECT+INSERT"
+                )
+                state["seq"] = seq
+                inserts.append(seq)
+                await asyncio.sleep(0)
+                return _fake_event_row(sid, encode_cursor(seq), seq, args[3], args[4])
+            if "UPDATE sessions" in q:
+                return {"id": uuid.UUID(sid)}
+            raise AssertionError(f"unexpected query: {q[:80]}")
+
+        with patch("app.events.fetch_one", side_effect=fake_fetch_one) as mock_fetch:
+            results = await asyncio.gather(
+                append_event(sid, "agent.message", {"i": 1}),
+                append_event(sid, "agent.deliverable", {"i": 2}),
+            )
+
+        assert sorted(inserts) == [1, 2]
+        seqs = sorted(e.seq for e in results)
+        assert seqs == [1, 2]
+        release_session_event_lock(sid)
+
+    @pytest.mark.asyncio
+    async def test_different_sessions_do_not_block_each_other(self):
+        """The lock is per-session — two different sessions append in
+        parallel without contention."""
+        sid_a = str(uuid.uuid4())
+        sid_b = str(uuid.uuid4())
+        release_session_event_lock(sid_a)
+        release_session_event_lock(sid_b)
+
+        in_flight = 0
+        max_in_flight = 0
+
+        async def fake_fetch_one(query, *args, **kwargs):
+            nonlocal in_flight, max_in_flight
+            q = " ".join(query.split())
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0)
+                if "SELECT COALESCE(MAX(seq)" in q:
+                    return {"next_seq": 1}
+                if q.startswith("INSERT INTO events"):
+                    return _fake_event_row(str(args[0]), encode_cursor(1), 1, args[3], args[4])
+                if "UPDATE sessions" in q:
+                    return {"id": args[1]}
+                raise AssertionError(q[:80])
+            finally:
+                in_flight -= 1
+
+        with patch("app.events.fetch_one", side_effect=fake_fetch_one):
+            await asyncio.gather(
+                append_event(sid_a, "agent.message", {}),
+                append_event(sid_b, "agent.message", {}),
+            )
+
+        # Per-session locks let cross-session work overlap. If both calls
+        # were serialized through a single global lock, max_in_flight would
+        # never exceed 1.
+        assert max_in_flight >= 2
+        release_session_event_lock(sid_a)
+        release_session_event_lock(sid_b)
+
+    @pytest.mark.asyncio
+    async def test_release_session_event_lock_drops_entry(self):
+        """The lock dict is bounded by terminate calls."""
+        sid = str(uuid.uuid4())
+        release_session_event_lock(sid)
+        events_mod._lock_for(uuid.UUID(sid))
+        assert uuid.UUID(sid) in events_mod._session_event_locks
+        release_session_event_lock(sid)
+        assert uuid.UUID(sid) not in events_mod._session_event_locks
+        # Idempotent on a missing entry.
+        release_session_event_lock(sid)
+        # Invalid uuid is a no-op, not a crash.
+        release_session_event_lock("not-a-uuid")
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ Mocks DB, provider, sandbox, and verifies:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -2006,6 +2007,53 @@ class TestRecoverSessions:
         # Dead session should be failed without orchestrator task
         assert (dead_sid, "failed") in transitions
         assert dead_sid not in orchestrator_tasks
+
+    @pytest.mark.asyncio
+    async def test_recovers_session_respawns_watcher(self):
+        """PR5 D4 — sessions whose containers survive get the deliverables
+        watcher re-attached so the boot scan ingests files written during
+        the outage. Regression for the gap where `/review` flagged that
+        recover_sessions never called watch_session_deliverables.
+        """
+        from app.orchestrator import recover_sessions
+        from app.sandbox import ExecResult
+
+        session_row = _make_session_row(status="running")
+        sandbox = MagicMock()
+        sandbox.exec = AsyncMock(return_value=ExecResult(stdout="", stderr="", exit_code=0))
+
+        orchestrator_tasks: dict = {}
+        watcher_tasks: dict = {}
+        watcher_calls: list[str] = []
+
+        async def fake_watcher(session_id: str) -> None:
+            watcher_calls.append(session_id)
+
+        async def mock_transition(sid, status):
+            pass
+
+        async def mock_append(sid, etype, payload):
+            return MagicMock()
+
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=[session_row]),
+            patch("app.orchestrator.transition", side_effect=mock_transition),
+            patch("app.orchestrator.append_event", side_effect=mock_append),
+            patch("app.orchestrator.run_session", new_callable=AsyncMock),
+        ):
+            await recover_sessions(
+                sandbox,
+                orchestrator_tasks,
+                watcher_tasks=watcher_tasks,
+                spawn_watcher=fake_watcher,
+            )
+
+        sid = str(session_row["id"])
+        assert sid in watcher_tasks, "watcher must be tracked for the recovered session"
+        # Let the task actually run.
+        await asyncio.sleep(0)
+        await watcher_tasks[sid]
+        assert watcher_calls == [sid], "spawn_watcher must be invoked exactly once for the alive session"
 
 
 # ---------------------------------------------------------------------------

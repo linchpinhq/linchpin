@@ -121,17 +121,24 @@ def _make_resource_row(
 
 
 @pytest.fixture()
-def sandbox_client():
+def sandbox_client(tmp_path):
     """TestClient with mocked sandbox + orchestrator (mirrors test_sessions fixture).
 
-    Also patches the PR3 mount-build path: ``os.path.isfile`` returns True by
-    default (so the disk re-check passes), and ``get_file_store`` returns a
-    stub whose ``absolute_path`` is deterministic. Individual tests can
-    override these via additional ``with patch(...)`` blocks to exercise the
-    mount-failure branch.
+    Patches:
+    - PR3 mount-build: ``os.path.isfile`` (True default), ``get_file_store`` (stub).
+    - PR5 deliverables: ``ensure_session_outputs_dir`` (writes to tmp_path),
+      ``watch_session_deliverables`` (no-op AsyncMock so no real watcher task spawns).
+
+    Individual tests can override any of these via nested ``with patch(...)``
+    blocks to exercise specific branches.
     """
     fake_store = MagicMock()
     fake_store.absolute_path = lambda sp: f"/var/lib/linchpin/files/{sp}"
+
+    def _fake_ensure(sid):
+        p = tmp_path / "session-outputs" / sid
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
     with (
         patch("app.main.check_migrations_current"),
@@ -145,6 +152,8 @@ def sandbox_client():
         patch("app.routes.sessions.get_file_store", return_value=fake_store),
         patch("app.routes.sessions.os.path.isfile", return_value=True),
         patch("app.routes.sessions.append_event", new_callable=AsyncMock),
+        patch("app.routes.sessions.ensure_session_outputs_dir", side_effect=_fake_ensure),
+        patch("app.routes.sessions.watch_session_deliverables", new_callable=AsyncMock),
     ):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-abc")
@@ -781,18 +790,22 @@ def test_create_session_passes_mounts_to_sandbox(
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
 
     assert resp.status_code == 201, resp.text
-    # sandbox.create called with mounts kwarg
+    # sandbox.create called with mounts kwarg. PR5 adds a writable /mnt/session/outputs
+    # bind alongside the file-resource :ro bind, so we look up the file mount by
+    # container_path rather than asserting list shape.
     call = mock_sandbox.create.call_args
-    # mounts is always passed as a kwarg by the route; .get() preserves [] correctly
-    # (using `or` would fall through on empty-list, masking the failure-path case).
     mounts = call.kwargs.get("mounts")
     assert mounts is not None
-    assert len(mounts) == 1
-    assert mounts[0] == ResourceMount(
+    file_mounts = [m for m in mounts if m.container_path == "/mnt/data/report.pdf"]
+    assert file_mounts == [ResourceMount(
         host_path="/var/lib/linchpin/files/aa/bb/cafebabe",
         container_path="/mnt/data/report.pdf",
         mode="ro",
-    )
+    )]
+    # And the PR5 writable outputs bind is always present.
+    outputs_mounts = [m for m in mounts if m.container_path == "/mnt/session/outputs"]
+    assert len(outputs_mounts) == 1
+    assert outputs_mounts[0].mode == "rw"
 
 
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
@@ -841,13 +854,14 @@ def test_create_session_marks_resource_failed_when_host_path_missing(
     body = resp.json()
     assert body["resources"][0]["state"] == "failed"
 
-    # sandbox.create was called with an EMPTY mounts list (the failed
-    # resource is skipped, not propagated to docker).
+    # The failed file resource is NOT in the mounts list (skipped, not
+    # propagated to docker). The writable outputs bind (PR5) IS still there.
     call = mock_sandbox.create.call_args
-    # mounts is always passed as a kwarg by the route; .get() preserves [] correctly
-    # (using `or` would fall through on empty-list, masking the failure-path case).
     mounts = call.kwargs.get("mounts")
-    assert mounts == []
+    file_mounts = [m for m in mounts if m.container_path == "/mnt/data/ghost.csv"]
+    assert file_mounts == [], "failed resource must not appear in mounts"
+    outputs_mounts = [m for m in mounts if m.container_path == "/mnt/session/outputs"]
+    assert len(outputs_mounts) == 1
 
     # And a session.resource_mount_failed event was emitted.
     # (We skip asserting args[0] == sid because the route generates the
