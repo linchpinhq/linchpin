@@ -94,12 +94,56 @@ class ModelConfig(BaseModel):
     base_url: str | None = None  # Override default endpoint for openrouter or ollama
 
 
+# v0.2.0 breaking bundle — `permission_policy` widens from a flat
+# Literal string to a discriminated `{type: ...}` object on the wire,
+# but storage stays string-shaped to avoid a migration. The
+# ``_normalize_permission_policy`` validator below accepts either input
+# shape and produces the canonical string. v1 shape (string) is the
+# canonical form; v2 (object) is the wire-only shape that translates in.
+PermissionPolicyLiteral = Literal["always_allow", "always_ask"]
+
+
+def _normalize_permission_policy(v: str | dict | None) -> str:
+    """Coerce permission_policy from either wire shape into the canonical
+    string. Accepts:
+
+    - ``"always_allow"`` / ``"always_ask"`` (v1, default)
+    - ``{"type": "always_allow"}`` / ``{"type": "always_ask"}`` (v2)
+
+    Anything else raises a validation error.
+    """
+    if v is None:
+        return "always_ask"
+    if isinstance(v, str):
+        if v not in ("always_allow", "always_ask"):
+            raise ValueError(
+                f"permission_policy {v!r} must be 'always_allow' or 'always_ask'"
+            )
+        return v
+    if isinstance(v, dict):
+        t = v.get("type")
+        if t not in ("always_allow", "always_ask"):
+            raise ValueError(
+                f"permission_policy.type {t!r} must be 'always_allow' "
+                "or 'always_ask'"
+            )
+        return t
+    raise ValueError(
+        f"permission_policy must be a string or {{type: ...}} object, got {type(v).__name__}"
+    )
+
+
 class BuiltinToolItemConfig(BaseModel):
     """A single tool inside a builtin toolset entry."""
 
     name: str
-    permission_policy: Literal["always_allow", "always_ask"] = "always_ask"
+    permission_policy: PermissionPolicyLiteral = "always_ask"
     enabled: bool = True
+
+    @field_validator("permission_policy", mode="before")
+    @classmethod
+    def _coerce_pp(cls, v):  # noqa: D401 — pydantic validator
+        return _normalize_permission_policy(v)
 
 
 class BuiltinToolConfig(BaseModel):
@@ -117,8 +161,13 @@ class CustomToolConfig(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
-    permission_policy: Literal["always_allow", "always_ask"] = "always_ask"
+    permission_policy: PermissionPolicyLiteral = "always_ask"
     endpoint: str | None = None  # HTTP endpoint for custom tool invocation
+
+    @field_validator("permission_policy", mode="before")
+    @classmethod
+    def _coerce_pp(cls, v):  # noqa: D401
+        return _normalize_permission_policy(v)
 
 
 # Discriminated union on the `type` field for clean validation errors
@@ -127,6 +176,26 @@ ToolConfig = Annotated[
     | Annotated[CustomToolConfig, Tag("custom")],
     Discriminator("type"),
 ]
+
+
+# v0.2.0 breaking bundle — toolset bundle wrapper. The v2 wire shape
+# `tools: {type: "linchpin_toolset_20260512", default_config, configs[]}`
+# is normalized down to the canonical v1 flat list at request validation
+# time. Storage stays flat-list shaped; v2 input gets unwrapped via the
+# ``unwrap_toolset_bundle`` helper called by Create/Update validators.
+TOOLSET_BUNDLE_TYPE = "linchpin_toolset_20260512"
+
+
+def unwrap_toolset_bundle(value: Any) -> list[dict] | Any:
+    """Accept either a flat list (v1) or a toolset bundle (v2) and return
+    the flat list form. Used by request validators so canonical storage
+    stays v1-shaped throughout v0.2.x.
+    """
+    if isinstance(value, dict) and value.get("type") == TOOLSET_BUNDLE_TYPE:
+        from app.api_version import tools_v2_to_v1
+
+        return tools_v2_to_v1(value)
+    return value
 
 
 class MCPServerConfig(BaseModel):
@@ -458,6 +527,14 @@ class CreateAgentRequest(BaseModel):
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
 
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _unwrap_toolset_bundle(cls, v):  # noqa: D401 — pydantic validator
+        # v0.2.0 breaking bundle — accept v2 `{type: linchpin_toolset_20260512, ...}`
+        # input by unwrapping to the canonical v1 flat list before discriminator
+        # validation runs.
+        return unwrap_toolset_bundle(v)
+
 
 class UpdateAgentRequest(BaseModel):
     """PATCH /v1/agents/{id} request body — all fields optional."""
@@ -469,6 +546,14 @@ class UpdateAgentRequest(BaseModel):
     mcp_servers: list[MCPServerConfig] | None = None
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] | None = None                  # v0.2.0 item #5
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _unwrap_toolset_bundle(cls, v):  # noqa: D401
+        # Same v2 → v1 unwrap as on Create.
+        if v is None:
+            return None
+        return unwrap_toolset_bundle(v)
 
 
 class CreateEnvironmentRequest(BaseModel):
