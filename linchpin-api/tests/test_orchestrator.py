@@ -119,7 +119,10 @@ class TestBuildContext:
                 "seq": 1,
             }
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert len(messages) == 2
         assert messages[1] == {"role": "user", "content": "Hello"}
@@ -130,7 +133,10 @@ class TestBuildContext:
         rows = [
             {"type": "agent.message", "payload": {"content": "Hi there"}, "seq": 1},
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert messages[1] == {"role": "assistant", "content": "Hi there"}
 
@@ -149,7 +155,10 @@ class TestBuildContext:
                 "seq": 2,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         # system + tool_use + tool_result
         assert len(messages) == 3
@@ -168,7 +177,10 @@ class TestBuildContext:
                 "seq": 1,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert messages[1]["content"][0]["is_error"] is True
 
@@ -1226,7 +1238,10 @@ class TestBuildContextMCPEvents:
                 "seq": 1,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         # system + mcp_tool_use
         assert len(messages) == 2
@@ -1244,7 +1259,10 @@ class TestBuildContextMCPEvents:
                 "seq": 1,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert len(messages) == 2
         assert messages[1]["role"] == "user"
@@ -1260,7 +1278,10 @@ class TestBuildContextMCPEvents:
                 "seq": 1,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert messages[1]["content"][0]["is_error"] is True
 
@@ -1274,7 +1295,10 @@ class TestBuildContextMCPEvents:
                 "seq": 1,
             },
         ]
-        with patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows):
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
             messages = await build_context(_SESSION_ID, agent)
         assert len(messages) == 2
         assert messages[1]["role"] == "assistant"

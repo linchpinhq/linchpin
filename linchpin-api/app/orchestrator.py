@@ -233,6 +233,44 @@ async def invoke_connector(
 # ---------------------------------------------------------------------------
 
 
+async def _build_memory_system_block(session_id: uuid.UUID) -> str:
+    """v0.3.0 — render the ``<linchpin:memory>`` block for the system
+    prompt by joining ``session_resources`` rows (type=memory_store)
+    against ``memory_stores`` to grab each store's name + description.
+
+    Returns the empty string when no memory_store resources are mounted.
+    """
+    from app.memory import render_memory_system_prompt_block
+
+    rows = await fetch_all(
+        """
+        SELECT sr.config, ms.name, ms.description
+        FROM session_resources sr
+        JOIN memory_stores ms
+             ON ms.id = (sr.config->>'memory_store_id')::uuid
+        WHERE sr.session_id = $1
+          AND sr.type = 'memory_store'
+          AND sr.state = 'mounted'
+        ORDER BY sr.created_at ASC
+        """,
+        session_id,
+    )
+    if not rows:
+        return ""
+    stores: list[dict] = []
+    for row in rows:
+        cfg = row["config"]
+        if isinstance(cfg, str):
+            cfg = json.loads(cfg)
+        stores.append({
+            "name": row["name"],
+            "access": cfg.get("access", "read_only"),
+            "description": row["description"],
+            "instructions": cfg.get("instructions"),
+        })
+    return render_memory_system_prompt_block(stores)
+
+
 async def build_context(session_id: str, agent: Agent) -> list[dict]:
     """Build the conversation messages list from the session event log.
 
@@ -253,9 +291,18 @@ async def build_context(session_id: str, agent: Agent) -> list[dict]:
 
     messages: list[dict] = []
 
-    # System message first
-    if agent.system:
-        messages.append({"role": "system", "content": agent.system})
+    # System message first. v0.3.0 — auto-inject the <linchpin:memory>
+    # block summarizing every memory_store resource mounted into this
+    # session, so the agent learns about its persistent state without
+    # the caller having to manage prompts themselves.
+    memory_block = await _build_memory_system_block(uid)
+    base_system = agent.system or ""
+    if memory_block:
+        system = f"{memory_block}\n\n{base_system}".rstrip() if base_system else memory_block
+    else:
+        system = base_system
+    if system:
+        messages.append({"role": "system", "content": system})
 
     for row in rows:
         event_type = row["type"]
