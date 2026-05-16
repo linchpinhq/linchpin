@@ -144,6 +144,30 @@ class Agent(BaseModel):
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     created_at: datetime
+    description: str | None = None                          # v0.2.0 item #5
+    metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
+    archived_at: datetime | None = None                     # v0.2.0 item #5
+
+
+class AgentVersion(BaseModel):
+    """Historical snapshot of an Agent's config taken on PATCH (v0.2.0 item #5).
+
+    Returned by ``GET /v1/agents/{id}/versions``. ``version`` matches the
+    ``agent_version`` field that gets pinned onto a Session at create-time,
+    so sessions can faithfully replay against the exact agent config they
+    booted under.
+    """
+
+    agent_id: str
+    version: int
+    name: str
+    description: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    model: ModelConfig
+    system: str
+    tools: list[ToolConfig] = Field(default_factory=list)
+    mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    snapshotted_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +275,8 @@ class CreateAgentRequest(BaseModel):
     system: str
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    description: str | None = None                          # v0.2.0 item #5
+    metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
 
 
 class UpdateAgentRequest(BaseModel):
@@ -261,6 +287,8 @@ class UpdateAgentRequest(BaseModel):
     system: str | None = None
     tools: list[ToolConfig] | None = None
     mcp_servers: list[MCPServerConfig] | None = None
+    description: str | None = None                          # v0.2.0 item #5
+    metadata: dict[str, Any] | None = None                  # v0.2.0 item #5
 
 
 class CreateEnvironmentRequest(BaseModel):
@@ -328,6 +356,9 @@ class AgentResponse(BaseModel):
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     created_at: datetime
+    description: str | None = None                          # v0.2.0 item #5
+    metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
+    archived_at: datetime | None = None                     # v0.2.0 item #5
 
 
 class EnvironmentResponse(BaseModel):

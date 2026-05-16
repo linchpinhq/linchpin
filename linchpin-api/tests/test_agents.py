@@ -26,6 +26,9 @@ def _make_agent_row(
     system: str = "You are helpful.",
     tools: list | None = None,
     mcp_servers: list | None = None,
+    description=None,
+    metadata: dict | None = None,
+    archived_at=None,
 ):
     """Build a fake asyncpg Record-like dict for an agent row."""
     return {
@@ -37,6 +40,29 @@ def _make_agent_row(
         "tools": tools or [],
         "mcp_servers": mcp_servers or [],
         "created_at": datetime(2025, 1, 1, tzinfo=timezone.utc),
+        "description": description,
+        "metadata": metadata or {},
+        "archived_at": archived_at,
+    }
+
+
+def _make_agent_version_row(
+    *,
+    agent_id: str | None = None,
+    version: int = 1,
+    name: str = "test-agent",
+):
+    return {
+        "agent_id": uuid.UUID(agent_id) if agent_id else uuid.uuid4(),
+        "version": version,
+        "name": name,
+        "description": None,
+        "metadata": {},
+        "model": {"provider": "openrouter", "id": "anthropic/claude-sonnet-4", "base_url": None},
+        "system": "You are helpful.",
+        "tools": [],
+        "mcp_servers": [],
+        "snapshotted_at": datetime(2025, 1, 1, tzinfo=timezone.utc),
     }
 
 
@@ -186,11 +212,12 @@ def test_get_agent_invalid_uuid_returns_404(client):
 # ---- PATCH /v1/agents/{id} ----
 
 
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
-def test_update_agent_name_returns_200(mock_fetch, client):
+def test_update_agent_name_returns_200(mock_fetch, mock_execute, client):
     """Updating only the name returns 200 with bumped version."""
     aid = str(uuid.uuid4())
-    mock_fetch.return_value = _make_agent_row(agent_id=aid, name="updated-name", version=2)
+    mock_fetch.side_effect = [_make_agent_row(agent_id=aid, name="updated-name", version=2), _make_agent_row(agent_id=aid, name="updated-name", version=2)]
 
     resp = client.patch(f"/v1/agents/{aid}", json={"name": "updated-name"}, headers=AUTH)
 
@@ -200,12 +227,13 @@ def test_update_agent_name_returns_200(mock_fetch, client):
     assert body["version"] == 2
 
 
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
-def test_update_agent_model_returns_200(mock_fetch, client):
+def test_update_agent_model_returns_200(mock_fetch, mock_execute, client):
     """Updating the model config returns 200."""
     aid = str(uuid.uuid4())
     new_model = {"provider": "openrouter", "id": "openai/gpt-4o", "base_url": None}
-    mock_fetch.return_value = _make_agent_row(agent_id=aid, model=new_model, version=2)
+    mock_fetch.side_effect = [_make_agent_row(agent_id=aid, model=new_model, version=2), _make_agent_row(agent_id=aid, model=new_model, version=2)]
 
     resp = client.patch(
         f"/v1/agents/{aid}",
@@ -218,11 +246,12 @@ def test_update_agent_model_returns_200(mock_fetch, client):
     assert resp.json()["model"]["id"] == "openai/gpt-4o"
 
 
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
-def test_update_agent_system_returns_200(mock_fetch, client):
+def test_update_agent_system_returns_200(mock_fetch, mock_execute, client):
     """Updating the system prompt returns 200."""
     aid = str(uuid.uuid4())
-    mock_fetch.return_value = _make_agent_row(agent_id=aid, system="New prompt", version=2)
+    mock_fetch.side_effect = [_make_agent_row(agent_id=aid, system="New prompt", version=2), _make_agent_row(agent_id=aid, system="New prompt", version=2)]
 
     resp = client.patch(
         f"/v1/agents/{aid}",
@@ -234,8 +263,9 @@ def test_update_agent_system_returns_200(mock_fetch, client):
     assert resp.json()["system"] == "New prompt"
 
 
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
-def test_update_agent_not_found_returns_404(mock_fetch, client):
+def test_update_agent_not_found_returns_404(mock_fetch, mock_execute, client):
     """Updating a non-existent agent returns 404."""
     mock_fetch.return_value = None
     aid = str(uuid.uuid4())
@@ -253,11 +283,12 @@ def test_update_agent_invalid_uuid_returns_404(client):
     assert resp.status_code == 404
 
 
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
 @patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
-def test_update_agent_empty_body_bumps_version(mock_fetch, client):
+def test_update_agent_empty_body_bumps_version(mock_fetch, mock_execute, client):
     """An empty update body still bumps the version."""
     aid = str(uuid.uuid4())
-    mock_fetch.return_value = _make_agent_row(agent_id=aid, version=2)
+    mock_fetch.side_effect = [_make_agent_row(agent_id=aid, version=2), _make_agent_row(agent_id=aid, version=2)]
 
     resp = client.patch(f"/v1/agents/{aid}", json={}, headers=AUTH)
 
@@ -317,3 +348,136 @@ def test_agents_endpoints_require_auth(client):
     assert client.get(f"/v1/agents/{uuid.uuid4()}").status_code == 401
     assert client.post("/v1/agents", json=VALID_PAYLOAD).status_code == 401
     assert client.patch(f"/v1/agents/{uuid.uuid4()}", json={"name": "x"}).status_code == 401
+
+
+# ---- v0.2.0 item #5: archive + versions + snapshot-on-PATCH ----
+
+
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_archive_agent_sets_archived_at(mock_fetch, client):
+    aid = str(uuid.uuid4())
+    archived_at = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    mock_fetch.side_effect = [
+        _make_agent_row(agent_id=aid),
+        _make_agent_row(agent_id=aid, archived_at=archived_at),
+    ]
+    resp = client.post(f"/v1/agents/{aid}/archive", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["archived_at"] is not None
+
+
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_archive_agent_idempotent(mock_fetch, client):
+    aid = str(uuid.uuid4())
+    archived_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    mock_fetch.return_value = _make_agent_row(agent_id=aid, archived_at=archived_at)
+
+    resp = client.post(f"/v1/agents/{aid}/archive", headers=AUTH)
+    assert resp.status_code == 200
+    assert mock_fetch.await_count == 1, "must not issue UPDATE on already-archived agent"
+
+
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_archive_agent_404_when_missing(mock_fetch, client):
+    mock_fetch.return_value = None
+    resp = client.post(f"/v1/agents/{uuid.uuid4()}/archive", headers=AUTH)
+    assert resp.status_code == 404
+
+
+@patch("app.routes.agents.fetch_all", new_callable=AsyncMock)
+def test_list_agents_excludes_archived_by_default(mock_fetch_all, client):
+    mock_fetch_all.return_value = []
+    resp = client.get("/v1/agents", headers=AUTH)
+    assert resp.status_code == 200
+    sql = mock_fetch_all.await_args.args[0]
+    assert "archived_at IS NULL" in sql
+
+
+@patch("app.routes.agents.fetch_all", new_callable=AsyncMock)
+def test_list_agents_include_archived_returns_all(mock_fetch_all, client):
+    mock_fetch_all.return_value = []
+    resp = client.get("/v1/agents?include_archived=true", headers=AUTH)
+    assert resp.status_code == 200
+    sql = mock_fetch_all.await_args.args[0]
+    assert "archived_at IS NULL" not in sql
+
+
+@patch("app.routes.agents.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_list_agent_versions_returns_history(mock_fetch_one, mock_fetch_all, client):
+    aid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(aid)}
+    mock_fetch_all.return_value = [
+        _make_agent_version_row(agent_id=aid, version=2),
+        _make_agent_version_row(agent_id=aid, version=1),
+    ]
+    resp = client.get(f"/v1/agents/{aid}/versions", headers=AUTH)
+    assert resp.status_code == 200
+    versions = resp.json()["data"]
+    assert [v["version"] for v in versions] == [2, 1]
+
+
+@patch("app.routes.agents.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_list_agent_versions_404_when_agent_missing(mock_fetch_one, mock_fetch_all, client):
+    mock_fetch_one.return_value = None
+    resp = client.get(f"/v1/agents/{uuid.uuid4()}/versions", headers=AUTH)
+    assert resp.status_code == 404
+    assert mock_fetch_all.await_count == 0
+
+
+@patch("app.routes.agents.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_list_agent_versions_empty_when_no_snapshots(mock_fetch_one, mock_fetch_all, client):
+    aid = str(uuid.uuid4())
+    mock_fetch_one.return_value = {"id": uuid.UUID(aid)}
+    mock_fetch_all.return_value = []
+    resp = client.get(f"/v1/agents/{aid}/versions", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["data"] == []
+
+
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_update_agent_snapshots_prior_state(mock_fetch, mock_execute, client):
+    """PATCH triggers an INSERT into agent_versions BEFORE the UPDATE applies."""
+    aid = str(uuid.uuid4())
+    prior = _make_agent_row(agent_id=aid, name="old-name", version=1)
+    updated = _make_agent_row(agent_id=aid, name="new-name", version=2)
+    mock_fetch.side_effect = [prior, updated]
+
+    resp = client.patch(f"/v1/agents/{aid}", json={"name": "new-name"}, headers=AUTH)
+    assert resp.status_code == 200
+    mock_execute.assert_awaited_once()
+    sql = mock_execute.await_args.args[0]
+    assert "INSERT INTO agent_versions" in sql
+    args = mock_execute.await_args.args[1:]
+    assert args[1] == 1  # PRE-update version
+
+
+@patch("app.routes.agents.execute", new_callable=AsyncMock)
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_update_archived_agent_409(mock_fetch, mock_execute, client):
+    """PATCH on an archived agent is rejected with 409 — no snapshot, no UPDATE."""
+    aid = str(uuid.uuid4())
+    archived_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    mock_fetch.return_value = _make_agent_row(agent_id=aid, archived_at=archived_at)
+
+    resp = client.patch(f"/v1/agents/{aid}", json={"name": "x"}, headers=AUTH)
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "agent_archived"
+    mock_execute.assert_not_awaited()
+
+
+@patch("app.routes.agents.fetch_one", new_callable=AsyncMock)
+def test_create_agent_with_description_and_metadata(mock_fetch, client):
+    metadata = {"team": "growth", "owner": "alice"}
+    mock_fetch.return_value = _make_agent_row(
+        description="a helpful research assistant",
+        metadata=metadata,
+    )
+    payload = {**VALID_PAYLOAD, "description": "a helpful research assistant", "metadata": metadata}
+    resp = client.post("/v1/agents", json=payload, headers=AUTH)
+    assert resp.status_code == 201
+    assert resp.json()["description"] == "a helpful research assistant"
+    assert resp.json()["metadata"] == metadata
