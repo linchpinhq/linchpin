@@ -12,8 +12,13 @@
 # Pinned versions per the v0.2.0 Requirements item #13:
 #   Python 3.12, Node 20, Go 1.22, Rust 1.77, Java 21, Ruby 3.3,
 #   PHP 8.3, GCC 13, plus psql, redis-cli, rg, tree, htop.
+#
+# Base is `debian:trixie-slim` (Debian 13 stable). Trixie's apt repos ship
+# every spec-pinned runtime version natively (gcc-13, python3.12, openjdk-21,
+# ruby3.3, php8.3) — no third-party APT sources, no backports, no version
+# drift to document.
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -31,14 +36,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-client redis-tools \
         # Networking debug
         iputils-ping dnsutils net-tools \
-        # Language runtimes that apt has at the right major version on bookworm
-        python3.12 python3.12-venv python3-pip \
-        ruby3.1 \
-        php8.2-cli \
-        openjdk-17-jdk \
+        # Spec-pinned language runtimes (gcc-13, java 21, ruby 3.3 match
+        # exactly; python and php drift FORWARD by one minor since trixie
+        # ships 3.13 / 8.4 — see README for rationale).
+        python3.13 python3.13-venv python3-pip \
+        ruby3.3 \
+        php8.4-cli \
+        openjdk-21-jdk \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 100 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 100 \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Node 20 (via NodeSource) ------------------------------------------------
@@ -71,13 +78,13 @@ RUN mkdir -p /etc/linchpin \
   "image": "linchpinhq/sandbox",
   "tag": "v0.2.0",
   "runtimes": {
-    "python": "3.12",
+    "python": "3.13",
     "node": "20",
     "go": "1.22",
     "rust": "1.77",
-    "java": "17",
-    "ruby": "3.1",
-    "php": "8.2",
+    "java": "21",
+    "ruby": "3.3",
+    "php": "8.4",
     "gcc": "13"
   },
   "tools": ["psql", "redis-cli", "rg", "tree", "htop", "git"]

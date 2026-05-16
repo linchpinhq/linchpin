@@ -10,24 +10,28 @@ apt-install at session boot.
 
 ## Contents
 
+Base is `debian:trixie-slim` (Debian 13 stable). Trixie's apt repos ship every
+runtime natively — no third-party APT sources, no backports.
+
 | Tool / runtime | Version | Notes |
 |---|---|---|
-| Python | 3.12 | `python` + `python3` both point here |
+| Python | 3.13 | `python` + `python3` both point here. Spec asked for 3.12; trixie ships 3.13 (forward-compatible). |
 | Node.js | 20.x | via NodeSource APT repo |
 | Go | 1.22.10 | `/usr/local/go/bin` on PATH |
 | Rust | 1.77.0 | rustup, minimal profile (no docs / extra components) |
-| Java | 17 (OpenJDK) | Debian Bookworm ships 17; 21 needs a third-party APT source we deferred |
-| Ruby | 3.1 | Bookworm default; 3.3 needs rbenv we deferred |
-| PHP | 8.2 | Bookworm default; 8.3 needs Sury repo we deferred |
-| GCC / G++ | 13 | via `gcc-13` apt package, `update-alternatives` points `gcc`/`g++` at 13 |
+| Java | 21 (OpenJDK) | matches spec |
+| Ruby | 3.3 | matches spec |
+| PHP | 8.4 | spec asked for 8.3; trixie ships 8.4 (forward-compatible). |
+| GCC / G++ | 13 | matches spec; `update-alternatives` points `gcc`/`g++` at 13 |
 | `psql`, `redis-cli` | latest from apt | per spec |
 | `rg`, `tree`, `htop`, `git` | latest from apt | per spec |
 | `iputils-ping`, `dnsutils`, `net-tools` | — | basic networking debug |
 
-> **Version drift from spec**: Java 21 / Ruby 3.3 / PHP 8.3 each needed a
-> separate APT source on Debian Bookworm. v0.2.0 ships the latest version
-> available from the base repo to minimize supply-chain surface; bumping
-> to spec-pinned versions is its own follow-on RFC.
+> **Forward-version drift from spec**: Python is 3.13 (spec: 3.12), PHP is 8.4
+> (spec: 8.3). Both are one minor version newer than the spec asked for and
+> are forward-compatible at the language level. The earlier draft of this
+> Dockerfile targeted bookworm and ended up *backwards*-drifted on Java/Ruby/PHP;
+> trixie inverts that trade.
 
 ## Build
 
