@@ -13,8 +13,9 @@ import io
 import logging
 import os
 import tarfile
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
@@ -32,11 +33,35 @@ class ExecResult:
     exit_code: int
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceMount:
+    """A single host->container bind mount for a session resource.
+
+    v0.2 PR3 (per eng-review decision D1) uses plain Docker ``-v`` bind
+    mounts rather than overlay2+tmpfs. ``mode='ro'`` is the default — file
+    resources are read-only. The deliverables-output bind (mode='rw') is
+    handled separately by PR5.
+    """
+
+    host_path: str
+    container_path: str
+    mode: Literal["ro", "rw"] = "ro"
+
+
 class SandboxProtocol(Protocol):
     """Abstract sandbox interface for container runtimes."""
 
-    async def create(self, image: str, network: str) -> str:
-        """Create and start a container, returning its id."""
+    async def create(
+        self,
+        image: str,
+        network: str,
+        mounts: Sequence[ResourceMount] | None = None,
+    ) -> str:
+        """Create and start a container, returning its id.
+
+        ``mounts`` is an optional list of host->container bind mounts applied
+        at boot. Empty/None preserves v0.1 behavior (no mounts).
+        """
         ...
 
     async def exec(self, container_id: str, command: str) -> ExecResult:
@@ -72,12 +97,22 @@ class DockerSandbox:
     # Public API
     # ------------------------------------------------------------------
 
-    async def create(self, image: str, network: str) -> str:
+    async def create(
+        self,
+        image: str,
+        network: str,
+        mounts: Sequence[ResourceMount] | None = None,
+    ) -> str:
         """Pull (if needed) and start a container on *network*.
+
+        ``mounts`` is applied as docker-py ``volumes={host: {bind, mode}}``.
+        Each ResourceMount is validated for absolute paths; the FileStore
+        path is the source of truth for host_path resolution at call sites.
 
         Returns the container id.
         """
         image = image or os.getenv("LINCHPIN_SANDBOX_IMAGE", DEFAULT_BASE_IMAGE)
+        volumes = self._build_volumes(mounts)
 
         try:
             container = await asyncio.to_thread(
@@ -88,6 +123,7 @@ class DockerSandbox:
                 detach=True,
                 stdin_open=True,
                 tty=False,
+                volumes=volumes,
             )
             return container.id
         except ImageNotFound:
@@ -107,12 +143,49 @@ class DockerSandbox:
                 detach=True,
                 stdin_open=True,
                 tty=False,
+                volumes=volumes,
             )
             return container.id
         except DockerException as exc:
             raise SandboxError(
                 f"Failed to create container from '{image}': {exc}"
             ) from exc
+
+    @staticmethod
+    def _build_volumes(
+        mounts: Sequence[ResourceMount] | None,
+    ) -> dict[str, dict[str, str]] | None:
+        """Translate ResourceMount list into docker-py ``volumes`` dict.
+
+        Returns ``None`` (not ``{}``) when mounts is empty so docker-py
+        treats the container as un-mounted, matching v0.1 behavior.
+        """
+        if not mounts:
+            return None
+        volumes: dict[str, dict[str, str]] = {}
+        for m in mounts:
+            if not m.host_path.startswith("/"):
+                raise SandboxError(
+                    f"ResourceMount.host_path must be absolute, got {m.host_path!r}"
+                )
+            if not m.container_path.startswith("/"):
+                raise SandboxError(
+                    f"ResourceMount.container_path must be absolute, got {m.container_path!r}"
+                )
+            # docker-py's ``volumes=`` dict is keyed by host_path: two mounts
+            # sharing a host_path silently collapse into the last one. The
+            # FileStore is content-addressed, so two distinct file_ids can
+            # share the same storage_path (and therefore the same host_path).
+            # Refuse loudly rather than ship a session whose container is
+            # missing a mount the API said was 'mounted'.
+            if m.host_path in volumes:
+                raise SandboxError(
+                    "duplicate host_path in mounts: "
+                    f"{m.host_path!r} appears for both "
+                    f"{volumes[m.host_path]['bind']!r} and {m.container_path!r}"
+                )
+            volumes[m.host_path] = {"bind": m.container_path, "mode": m.mode}
+        return volumes
 
     async def exec(self, container_id: str, command: str) -> ExecResult:
         """Execute *command* inside the container via ``bash -c``."""

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.sandbox import DockerSandbox, ExecResult, SandboxError
+from app.sandbox import DockerSandbox, ExecResult, ResourceMount, SandboxError
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,112 @@ class TestCreate:
             detach=True,
             stdin_open=True,
             tty=False,
+            volumes=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_create_with_mounts_passes_volumes(self):
+        """PR3 — mounts list should translate to docker-py ``volumes`` dict."""
+        client = _mock_client()
+        container = MagicMock()
+        container.id = "mnt123"
+        client.containers.run.return_value = container
+
+        mounts = [
+            ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/abcd", container_path="/mnt/data.csv"),
+            ResourceMount(host_path="/var/lib/linchpin/files/cc/dd/cdef", container_path="/mnt/extra/file.txt", mode="ro"),
+        ]
+        sandbox = DockerSandbox(client=client)
+        cid = await sandbox.create("img", "linchpin-none", mounts=mounts)
+
+        assert cid == "mnt123"
+        called_volumes = client.containers.run.call_args.kwargs["volumes"]
+        assert called_volumes == {
+            "/var/lib/linchpin/files/aa/bb/abcd": {"bind": "/mnt/data.csv", "mode": "ro"},
+            "/var/lib/linchpin/files/cc/dd/cdef": {"bind": "/mnt/extra/file.txt", "mode": "ro"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_with_empty_mounts_passes_none(self):
+        client = _mock_client()
+        container = MagicMock()
+        container.id = "x"
+        client.containers.run.return_value = container
+
+        sandbox = DockerSandbox(client=client)
+        await sandbox.create("img", "net", mounts=[])
+
+        # Empty list should normalize to None so docker-py treats the container
+        # as unmounted (matches v0.1 behavior pre-PR3).
+        assert client.containers.run.call_args.kwargs["volumes"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_absolute_host_path(self):
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="host_path must be absolute"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[ResourceMount(host_path="relative/path", container_path="/mnt/x")],
+            )
+        # No container.run call should have happened — validation fails before docker.
+        client.containers.run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_absolute_container_path(self):
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="container_path must be absolute"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[ResourceMount(host_path="/abs/path", container_path="relative")],
+            )
+        client.containers.run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_duplicate_host_path(self):
+        """docker-py ``volumes=`` is keyed by host_path; two mounts sharing
+        a host_path would silently collapse into the last one. Refuse
+        loudly so the API never claims state='mounted' for a bind that
+        didn't actually reach docker."""
+        client = _mock_client()
+        sandbox = DockerSandbox(client=client)
+
+        with pytest.raises(SandboxError, match="duplicate host_path"):
+            await sandbox.create(
+                "img",
+                "net",
+                mounts=[
+                    ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/dup", container_path="/mnt/a"),
+                    ResourceMount(host_path="/var/lib/linchpin/files/aa/bb/dup", container_path="/mnt/b"),
+                ],
+            )
+        client.containers.run.assert_not_called()
+
+    def test_build_volumes_preserves_distinct_host_paths(self):
+        """Sanity check: two distinct host_paths produce two volume entries."""
+        from app.sandbox import DockerSandbox
+        volumes = DockerSandbox._build_volumes([
+            ResourceMount(host_path="/host/a", container_path="/c/1"),
+            ResourceMount(host_path="/host/b", container_path="/c/2"),
+        ])
+        assert volumes == {
+            "/host/a": {"bind": "/c/1", "mode": "ro"},
+            "/host/b": {"bind": "/c/2", "mode": "ro"},
+        }
+
+    def test_build_volumes_raises_on_duplicate_host_path(self):
+        """Direct unit on the staticmethod — no docker mocks needed."""
+        from app.sandbox import DockerSandbox
+        with pytest.raises(SandboxError, match="duplicate host_path"):
+            DockerSandbox._build_volumes([
+                ResourceMount(host_path="/host/a", container_path="/c/1"),
+                ResourceMount(host_path="/host/a", container_path="/c/2"),
+            ])
 
     @pytest.mark.asyncio
     async def test_create_pulls_on_image_not_found(self):
