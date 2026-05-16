@@ -1,7 +1,7 @@
 """Agent versioning + archive + description + metadata (v0.2.0 item #5).
 
 Revision ID: 0006
-Revises: 0004
+Revises: 0005
 Create Date: 2026-05-15 00:00:00.000000
 
 Adds three things to support the v0.2.0 item #5 surface:
@@ -16,8 +16,8 @@ Adds three things to support the v0.2.0 item #5 surface:
    return historical config, which sessions use to pin agent_version on
    the session row.
 
-Note: this migration shares the ``Revises: 0004`` link with v0.2.0 item #6's
-migration 0005. When both land, the later one rebases to chain off the first.
+Chains off ``0005`` (env archive from item #6) — both originally chained
+off ``0004``; this one rebased to land second.
 """
 from typing import Sequence, Union
 
@@ -25,7 +25,7 @@ from alembic import op
 
 
 revision: str = "0006"
-down_revision: Union[str, None] = "0004"
+down_revision: Union[str, None] = "0005"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
