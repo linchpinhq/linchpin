@@ -103,6 +103,9 @@ def sandbox_client(tmp_path):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-abc")
         mock_sandbox.destroy = AsyncMock()
+        mock_sandbox.ensure_image = AsyncMock(
+            side_effect=lambda *, base_image, packages: base_image
+        )
         MockSandbox.return_value = mock_sandbox
 
         from app.main import app
@@ -162,7 +165,10 @@ def test_create_session_unrestricted_network(mock_fetch, sandbox_client):
     # at least the writable /mnt/session/outputs bind; no resources means
     # exactly that one entry.
     args, kwargs = mock_sandbox.create.call_args
-    assert args == ("", "linchpin-open")
+    # v0.2.0 item #3 — image is now resolved by sandbox.ensure_image() before
+    # reaching create(). Test mock passes the base_image through unchanged.
+    from app.sandbox import DEFAULT_BASE_IMAGE
+    assert args == (DEFAULT_BASE_IMAGE, "linchpin-open")
     assert len(kwargs["mounts"]) == 1
     assert kwargs["mounts"][0].container_path == "/mnt/session/outputs"
     assert kwargs["mounts"][0].mode == "rw"
@@ -186,7 +192,8 @@ def test_create_session_none_network(mock_fetch, sandbox_client):
 
     assert resp.status_code == 201
     args, kwargs = mock_sandbox.create.call_args
-    assert args == ("", "linchpin-none")
+    from app.sandbox import DEFAULT_BASE_IMAGE
+    assert args == (DEFAULT_BASE_IMAGE, "linchpin-none")
     assert len(kwargs["mounts"]) == 1
     assert kwargs["mounts"][0].container_path == "/mnt/session/outputs"
 

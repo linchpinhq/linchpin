@@ -28,11 +28,12 @@ from app.db import fetch_all, fetch_one, execute, listen, notify
 from app.events import append_event, decode_cursor, get_events, release_session_event_lock
 from app.files import get_file_store
 from app.orchestrator import run_session
-from app.sandbox import ResourceMount, SandboxError
+from app.sandbox import DEFAULT_BASE_IMAGE, ResourceMount, SandboxError
 from app.streaming import get_stream
 from app.watcher import ensure_session_outputs_dir, session_outputs_dir, watch_session_deliverables
 from app.models import (
     CreateSessionRequest,
+    EnvironmentPackages,
     EventResponse,
     FileResource,
     PaginatedEventsResponse,
@@ -349,7 +350,27 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
 
     # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
-    image = ""  # empty string lets DockerSandbox use default/env var
+
+    # v0.2.0 item #3 — derive a packaged image when the environment lists
+    # any pre-install packages. Empty package set falls through to the
+    # base image at no extra cost.
+    base_image = os.getenv("LINCHPIN_SANDBOX_IMAGE", DEFAULT_BASE_IMAGE)
+    packages_dict = env_config.get("packages") if isinstance(env_config, dict) else None
+    env_packages = EnvironmentPackages.model_validate(packages_dict or {})
+    try:
+        image = await sandbox.ensure_image(
+            base_image=base_image, packages=env_packages
+        )
+    except SandboxError as exc:
+        logger.error("sandbox.ensure_image failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "sandbox_image_build_failed",
+                "message": str(exc),
+            },
+        ) from exc
+
     try:
         container_id = await sandbox.create(image, network, mounts=mounts)
     except SandboxError as exc:

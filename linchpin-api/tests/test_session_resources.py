@@ -158,6 +158,9 @@ def sandbox_client(tmp_path):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-abc")
         mock_sandbox.destroy = AsyncMock()
+        mock_sandbox.ensure_image = AsyncMock(
+            side_effect=lambda *, base_image, packages: base_image
+        )
         MockSandbox.return_value = mock_sandbox
 
         from app.main import app

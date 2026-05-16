@@ -18,7 +18,9 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import docker
-from docker.errors import APIError, DockerException, ImageNotFound, NotFound
+from docker.errors import APIError, BuildError, DockerException, ImageNotFound, NotFound
+
+from app.models import EnvironmentPackages, derived_image_tag
 
 
 # v0.2.0 item #13 — sessions default to the richer linchpin-sandbox image
@@ -27,6 +29,8 @@ from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 # linchpin-sandbox/Dockerfile in the repo. Override with LINCHPIN_SANDBOX_IMAGE
 # for tests or for ops to roll back to a slimmer image.
 DEFAULT_BASE_IMAGE = "linchpinhq/sandbox:v0.2.0"
+
+logger = logging.getLogger("linchpin-api.sandbox")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,20 @@ class SandboxProtocol(Protocol):
 
         ``mounts`` is an optional list of host->container bind mounts applied
         at boot. Empty/None preserves v0.1 behavior (no mounts).
+        """
+        ...
+
+    async def ensure_image(
+        self,
+        *,
+        base_image: str,
+        packages: EnvironmentPackages | None,
+    ) -> str:
+        """Return the image tag to use for a session, building if needed.
+
+        Empty/None ``packages`` returns ``base_image`` unchanged. Non-empty
+        package sets are baked into a content-hashed derived image; the
+        Docker daemon's image cache makes the second call a no-op.
         """
         ...
 
@@ -155,6 +173,124 @@ class DockerSandbox:
             raise SandboxError(
                 f"Failed to create container from '{image}': {exc}"
             ) from exc
+
+    async def ensure_image(
+        self,
+        *,
+        base_image: str,
+        packages: EnvironmentPackages | None,
+    ) -> str:
+        """Build (if absent) and return the derived-image tag for ``packages``.
+
+        v0.2.0 item #3. The derived image is keyed by a content hash of the
+        normalized package set, so two environments with the same package
+        list share one image and the second session pays zero build cost.
+        Empty/None packages returns ``base_image`` unchanged.
+        """
+        if packages is None or packages.is_empty():
+            return base_image
+
+        tag = derived_image_tag(packages)
+        assert tag is not None, "non-empty packages must yield a tag"
+
+        # Fast path: image already cached on this host's daemon.
+        try:
+            await asyncio.to_thread(self._client.images.get, tag)
+            return tag
+        except ImageNotFound:
+            pass
+
+        dockerfile = self._generate_dockerfile(base_image, packages)
+        logger.info(
+            "building derived sandbox image %s from %s (apt=%d pip=%d npm=%d "
+            "cargo=%d gem=%d go=%d)",
+            tag,
+            base_image,
+            len(packages.apt),
+            len(packages.pip),
+            len(packages.npm),
+            len(packages.cargo),
+            len(packages.gem),
+            len(packages.go),
+        )
+        try:
+            await asyncio.to_thread(
+                self._build_image,
+                dockerfile=dockerfile,
+                tag=tag,
+            )
+        except BuildError as exc:
+            raise SandboxError(
+                f"Failed to build derived image {tag!r} from {base_image!r}: {exc}"
+            ) from exc
+        except DockerException as exc:
+            raise SandboxError(
+                f"Docker error while building {tag!r}: {exc}"
+            ) from exc
+        return tag
+
+    @staticmethod
+    def _generate_dockerfile(
+        base_image: str, packages: EnvironmentPackages
+    ) -> str:
+        """Render a single-stage Dockerfile that installs *packages* on top
+        of *base_image*.
+
+        Package names are pre-validated against ``_PACKAGE_NAME_RE`` (in
+        ``models.py``) so embedding them directly in the RUN line is safe.
+        Each manager gets its own RUN to keep the image layer cache useful
+        across edits that only touch one ecosystem.
+        """
+        lines: list[str] = [f"FROM {base_image}", ""]
+
+        if packages.apt:
+            joined = " ".join(packages.apt)
+            lines.append(
+                "RUN apt-get update "
+                f"&& apt-get install -y --no-install-recommends {joined} "
+                "&& rm -rf /var/lib/apt/lists/*"
+            )
+        if packages.pip:
+            joined = " ".join(packages.pip)
+            # --break-system-packages is required on Debian trixie's
+            # PEP 668-marked python3.13. Safe inside the sandbox image.
+            lines.append(
+                f"RUN pip install --no-cache-dir --break-system-packages {joined}"
+            )
+        if packages.npm:
+            joined = " ".join(packages.npm)
+            lines.append(
+                f"RUN npm install -g --no-fund --no-audit {joined}"
+            )
+        if packages.cargo:
+            joined = " ".join(packages.cargo)
+            lines.append(f"RUN cargo install --locked {joined}")
+        if packages.gem:
+            joined = " ".join(packages.gem)
+            lines.append(f"RUN gem install --no-document {joined}")
+        if packages.go:
+            # `go install <pkg>@<ver>` is the modern (1.16+) form. One RUN
+            # per package keeps each install's failure isolated in logs.
+            for pkg in packages.go:
+                lines.append(f"RUN go install {pkg}")
+
+        return "\n".join(lines) + "\n"
+
+    def _build_image(self, *, dockerfile: str, tag: str) -> None:
+        """Synchronous docker-py build helper.
+
+        Passes the rendered Dockerfile as ``fileobj`` — docker-py treats it
+        as the build context when ``custom_context`` is False. No COPY/ADD
+        instructions are emitted, so no extra files are needed in the tar.
+        """
+        fileobj = io.BytesIO(dockerfile.encode("utf-8"))
+        self._client.images.build(
+            fileobj=fileobj,
+            tag=tag,
+            rm=True,
+            forcerm=True,
+            pull=False,
+        )
 
     @staticmethod
     def _build_volumes(

@@ -90,6 +90,12 @@ def client():
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-mock")
         mock_sandbox.destroy = AsyncMock()
+        # v0.2.0 item #3 — sessions now route image selection through
+        # sandbox.ensure_image(). Default behavior in tests is pass-through:
+        # whatever base_image the route resolved is what create() sees.
+        mock_sandbox.ensure_image = AsyncMock(
+            side_effect=lambda *, base_image, packages: base_image
+        )
         MockSandbox.return_value = mock_sandbox
 
         from app.main import app

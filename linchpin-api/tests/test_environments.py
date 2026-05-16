@@ -292,3 +292,83 @@ def test_environments_endpoints_require_auth(client):
     assert client.post("/v1/environments", json=VALID_PAYLOAD).status_code == 401
     assert client.post(f"/v1/environments/{uuid.uuid4()}/archive").status_code == 401
     assert client.delete(f"/v1/environments/{uuid.uuid4()}").status_code == 401
+
+
+# ---- v0.2.0 item #3 — packages ----
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_create_environment_with_packages(mock_fetch, client):
+    """Packages across all six managers round-trip through the API."""
+    config = {
+        "networking": {"type": "unrestricted"},
+        "packages": {
+            "apt": ["jq", "ripgrep"],
+            "pip": ["httpx", "requests==2.32.3"],
+            "npm": ["@scope/pkg", "typescript"],
+            "cargo": ["ripgrep"],
+            "gem": ["bundler"],
+            "go": ["github.com/cli/cli/v2/cmd/gh@v2.50.0"],
+        },
+    }
+    mock_fetch.return_value = _make_env_row(config=config)
+
+    payload = {"name": "pkg-env", "config": config}
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["config"]["packages"]["apt"] == ["jq", "ripgrep"]
+    assert body["config"]["packages"]["pip"] == ["httpx", "requests==2.32.3"]
+    assert body["config"]["packages"]["go"][0].endswith("@v2.50.0")
+
+
+@patch("app.routes.environments.fetch_one", new_callable=AsyncMock)
+def test_create_environment_omitting_packages_defaults_to_empty(mock_fetch, client):
+    """A request without `packages` still validates; defaults to empty lists."""
+    mock_fetch.return_value = _make_env_row()
+
+    resp = client.post("/v1/environments", json=VALID_PAYLOAD, headers=AUTH)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["config"]["packages"] == {
+        "apt": [], "pip": [], "npm": [], "cargo": [], "gem": [], "go": [],
+    }
+
+
+def test_create_environment_rejects_shell_metacharacters_in_package_name(client):
+    """A package name containing shell metacharacters is rejected with 422."""
+    payload = {
+        "name": "bad",
+        "config": {
+            "networking": {"type": "none"},
+            "packages": {"apt": ["jq; rm -rf /"]},
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_create_environment_rejects_duplicate_packages(client):
+    payload = {
+        "name": "dup",
+        "config": {
+            "networking": {"type": "none"},
+            "packages": {"pip": ["httpx", "httpx"]},
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_create_environment_rejects_too_many_packages(client):
+    payload = {
+        "name": "huge",
+        "config": {
+            "networking": {"type": "none"},
+            "packages": {"apt": [f"pkg-{i}" for i in range(257)]},
+        },
+    }
+    resp = client.post("/v1/environments", json=payload, headers=AUTH)
+    assert resp.status_code == 422
