@@ -6,6 +6,38 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 _No unreleased changes yet._
 
+## [0.7.0] - 2026-05-17
+
+> **Research preview** — Dreams ship as opt-in by environment variable, mirroring Anthropic's own research-preview posture for the same feature.
+
+Dreams — async memory curation. A Dream reads an input memory store + a filtered slice of past sessions and produces a *new* memory store with the curated content. The input store is never modified. One PR.
+
+### Added
+
+#### Dreams (research preview)
+
+- **`dreams` table** (Alembic 0015) with `pending` → `running` → `completed` / `failed` / `canceled` state machine. Links to input + output memory stores and the dreamer's session via `ON DELETE SET NULL` so deleting referenced rows doesn't cascade through history.
+- **`POST /v1/dreams`** — kick off a Dream. Validates input store exists + isn't archived, dreamer agent is configured + isn't archived, and the output store name isn't already in use. Inserts at `pending`. Body: `input_memory_store_id`, `output_store_name`, optional `session_filter` (`agent_id` / `since` / `until` / `limit` capped at 100), optional `dreamer_agent_id` override.
+- **`GET /v1/dreams`** — paginated, optional `?status=` filter, newest first.
+- **`GET /v1/dreams/{id}`** — full status row including the output store id once curation completes.
+- **`POST /v1/dreams/{id}/cancel`** — flips a pending/running Dream to `canceled` and best-effort terminates the underlying dreamer session. Terminal Dreams 409.
+- A Dream is itself a normal Linchpin session — the dreamer agent's system prompt + tools own the actual curation logic. The platform supplies the lifecycle table; operators ship the dreamer.
+
+### Operator notes
+
+- Set **`LINCHPIN_DREAMER_AGENT_ID`** to the agent id Linchpin should default-spawn for dreams. Without it, `POST /v1/dreams` returns 422 `dreamer_not_configured` unless the request supplies `dreamer_agent_id` directly — explicit opt-in is intentional for the research preview.
+- Session filter caps at **100 sessions per Dream** (`MAX_SESSIONS_PER_DREAM`) — matches Anthropic's limit.
+- Output store is a new memory store, not a mutation of the input. The user/operator decides whether to swap the agent's attached resource to the new store or keep both around.
+
+### Out of scope (deferred)
+
+- Auto-scheduling Dreams on a cron — operators wire that themselves.
+- Cross-store curation, cross-workspace visibility.
+
+### Schema migrations
+
+- `0015_dreams` — `dreams` table + indexes on `(workspace_id, created_at DESC)` and the partial `(status IN ('pending', 'running'))` index for the runner queue.
+
 ## [0.6.0] - 2026-05-17
 
 Outcomes + Multi-agent threads. Linchpin starts looking less like "an API for running an agent" and more like "an API for running a team." Two PRs.
