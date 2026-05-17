@@ -209,13 +209,61 @@ def unwrap_toolset_bundle(value: Any) -> list[dict] | Any:
     return value
 
 
-class MCPServerConfig(BaseModel):
-    """MCP server subprocess configuration."""
+class StdioMCPServerConfig(BaseModel):
+    """MCP server reached via a local subprocess over stdio.
 
+    The legacy v0.4 shape — ``command`` / ``args`` / ``env`` —
+    continues to validate as this variant. The ``type`` discriminator
+    is optional on the wire: a config without ``type`` is interpreted
+    as stdio for backwards compat with rows persisted before v0.5.0.
+    """
+
+    type: Literal["stdio"] = "stdio"
     name: str
     command: str
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+
+
+class UrlMCPServerConfig(BaseModel):
+    """MCP server reached over HTTP-streamable transport (v0.5.0).
+
+    Auth flows through the session's ``vault_ids[]`` — each vault id
+    listed in ``vault_ids`` resolves to a credential the connector
+    injects as a Bearer token on the upstream request. OAuth tokens
+    refresh automatically using the existing vault credential
+    machinery.
+    """
+
+    type: Literal["url"]
+    name: str
+    url: str
+    vault_ids: list[str] = Field(default_factory=list)
+
+
+def _normalize_mcp_server_input(value: object) -> object:
+    """Default ``type`` to ``stdio`` so v0.4 shapes keep validating
+    after the discriminator landed. Pass anything that's not a plain
+    dict through unchanged so model.copy()/.model_dump() round-trips
+    don't break.
+    """
+    if isinstance(value, dict) and "type" not in value:
+        return {**value, "type": "stdio"}
+    return value
+
+
+MCPServerConfig = Annotated[
+    Annotated[StdioMCPServerConfig, Tag("stdio")]
+    | Annotated[UrlMCPServerConfig, Tag("url")],
+    Discriminator("type"),
+]
+
+
+def normalize_mcp_servers(values: list[object]) -> list[object]:
+    """Apply ``_normalize_mcp_server_input`` to a list — call this from
+    Pydantic ``mode="before"`` validators on every field that accepts
+    ``mcp_servers``."""
+    return [_normalize_mcp_server_input(v) for v in values]
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +289,13 @@ class Agent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
     archived_at: datetime | None = None                     # v0.2.0 item #5
 
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_servers(cls, v):  # noqa: D401
+        # v0.5.0 — DB rows from v0.4 lack the ``type`` discriminator;
+        # default to ``stdio`` so they keep validating.
+        return normalize_mcp_servers(v) if v is not None else v
+
 
 class AgentVersion(BaseModel):
     """Historical snapshot of an Agent's config taken on PATCH (v0.2.0 item #5).
@@ -262,6 +317,11 @@ class AgentVersion(BaseModel):
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)         # v0.4.0
     snapshotted_at: datetime
+
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_servers(cls, v):  # noqa: D401
+        return normalize_mcp_servers(v) if v is not None else v
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +612,15 @@ class CreateAgentRequest(BaseModel):
         # validation runs.
         return unwrap_toolset_bundle(v)
 
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_servers(cls, v):  # noqa: D401
+        # v0.5.0 — entries without ``type`` are interpreted as stdio so
+        # rows persisted before the discriminator landed still parse.
+        if v is None:
+            return v
+        return normalize_mcp_servers(v)
+
     @field_validator("skills")
     @classmethod
     def _enforce_skills_cap(cls, v: list[str]) -> list[str]:
@@ -584,6 +653,13 @@ class UpdateAgentRequest(BaseModel):
         if v is None:
             return None
         return unwrap_toolset_bundle(v)
+
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_servers(cls, v):  # noqa: D401
+        if v is None:
+            return v
+        return normalize_mcp_servers(v)
 
     @field_validator("skills")
     @classmethod
@@ -824,6 +900,11 @@ class AgentResponse(BaseModel):
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
     archived_at: datetime | None = None                     # v0.2.0 item #5
+
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_servers(cls, v):  # noqa: D401
+        return normalize_mcp_servers(v) if v is not None else v
 
 
 class EnvironmentResponse(BaseModel):
