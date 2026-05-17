@@ -1,6 +1,6 @@
 [project]
 name = "linchpin-api"
-version = "0.5.0"
+version = "0.6.0"
 description = "Linchpin API — FastAPI service for managed AI agents"
 requires-python = ">=3.12"
 dependencies = [
