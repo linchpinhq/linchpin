@@ -6,6 +6,43 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 _No unreleased changes yet._
 
+## [0.6.0] - 2026-05-17
+
+Outcomes + Multi-agent threads. Linchpin starts looking less like "an API for running an agent" and more like "an API for running a team." Two PRs.
+
+### Added
+
+#### Outcomes
+
+- **`session.outcome`** declarable at session create. Free-text definition (≤4 KB) + weighted rubric (≤16 criteria, weights sum to 1.0 with 1e-6 float tolerance) + agent grader (`{type: "agent", agent_id: …}`). Persisted as JSONB on `sessions.outcome` (Alembic 0013).
+- **`OutcomeAgentGrader`** is the v0.6 grader variant — the grader is itself a Linchpin agent. The discriminator leaves room for a deterministic-rubric grader as a future variant without changing existing callers.
+- **`POST /v1/sessions/{id}/outcome_evaluations`** records a grader result. Validates `score in [0, 1]`, persists into the new append-only `outcome_evaluations` table, and emits `session.outcome_evaluation_ended`. Auto-terminates the session + emits `session.status_terminated` when the score crosses `success_threshold` (default 0.8). `auto_terminate: false` opts out of the auto-terminate behavior. Threshold is read from the stored outcome (not the request body) so a malicious grader can't lower the bar.
+- **`GET /v1/sessions/{id}/outcome_evaluations`** returns the history newest-first.
+
+#### Multi-agent threads
+
+- **`sessions.parent_session_id`** column (Alembic 0014, `ON DELETE SET NULL`). NULL = root session; non-NULL = thread spawned by another session. Indexed for fast "list threads of a parent" reads.
+- **`POST /v1/sessions/{parent_id}/threads`** spawns a worker thread. Validates the parent exists + isn't archived, enforces the depth cap (`LINCHPIN_MAX_THREAD_DEPTH`, default 3), forwards to the existing `create_session` flow, stamps `parent_session_id`, seeds the worker with an optional `input_message`, and emits `session.thread_created` on the parent's event log.
+- **`GET /v1/sessions/{parent_id}/threads`** returns every thread of a parent (including terminated), oldest-first.
+- **Event mirroring.** Every event posted to a thread is also appended to each ancestor's event log with a `thread_id` payload tag so a coordinator watching its own stream sees one interleaved view. NOTIFY fires on each ancestor channel too — SSE subscribers tailing the coordinator wake up on a thread write.
+- **`session.thread_terminated`** emitted on the parent when a thread terminates — symmetric with `session.thread_created`.
+- **Depth cap defense-in-depth**: the chain walker bails at 32 hops so a pathological cycle in the data can't loop the API forever.
+
+### Event taxonomy additions
+
+- `session.outcome_evaluation_started`, `session.outcome_evaluation_ended`
+- `agent.thread_create` (request shape), `session.thread_created`, `session.thread_idled`, `session.thread_terminated` — the webhook event names declared back in v0.2.0 are now fired by the runtime.
+
+### Schema migrations
+
+- `0013_sessions_outcome` — `sessions.outcome` (JSONB), new `outcome_evaluations` table with `(session_id, created_at DESC)` index.
+- `0014_sessions_parent` — `sessions.parent_session_id` (self-referential FK), partial index where non-NULL.
+
+### Operator notes
+
+- `LINCHPIN_MAX_THREAD_DEPTH` defaults to 3 — coordinator → worker → grader is the canonical pattern. Increase only when a workflow legitimately needs deeper trees.
+- Event-mirroring writes are best-effort: a failure to mirror to an ancestor logs + continues so the thread's own event log isn't held hostage to an upstream NOTIFY hiccup.
+
 ## [0.5.0] - 2026-05-16
 
 Multimodal content + Remote MCP + Git repositories. Three medium-sized features bundled into one minor that round out the resource and content surface. Three PRs.
