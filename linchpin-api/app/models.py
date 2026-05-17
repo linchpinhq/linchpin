@@ -1738,3 +1738,66 @@ class OutcomeEvaluationsResponse(BaseModel):
     """Payload for ``GET /v1/sessions/{id}/outcome_evaluations``."""
 
     data: list[OutcomeEvaluation]
+
+
+# ---------------------------------------------------------------------------
+# Dreams — async memory curation (v0.7.0, research preview)
+# ---------------------------------------------------------------------------
+
+DreamStatus = Literal["pending", "running", "completed", "failed", "canceled"]
+DREAM_TERMINAL_STATES: frozenset[str] = frozenset({"completed", "failed", "canceled"})
+
+# Per Anthropic's Dreams limits.
+MAX_SESSIONS_PER_DREAM = 100
+
+
+class DreamSessionFilter(BaseModel):
+    """Filter the past sessions a Dream curates over.
+
+    All fields are AND'd together. Empty (default) means "every
+    session in the workspace"; the runtime still caps at
+    ``MAX_SESSIONS_PER_DREAM`` so a wide-open filter doesn't drag in
+    the whole history.
+    """
+
+    agent_id: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    limit: int = Field(default=MAX_SESSIONS_PER_DREAM, ge=1, le=MAX_SESSIONS_PER_DREAM)
+
+
+class CreateDreamRequest(BaseModel):
+    """``POST /v1/dreams`` request body."""
+
+    input_memory_store_id: str
+    output_store_name: str
+    session_filter: DreamSessionFilter = Field(default_factory=DreamSessionFilter)
+    # Override the default dreamer agent (``LINCHPIN_DREAMER_AGENT_ID``)
+    # for this run only — handy for A/B-testing curation prompts
+    # without redeploying the env var.
+    dreamer_agent_id: str | None = None
+
+
+class Dream(BaseModel):
+    """A single Dream record."""
+
+    id: str
+    input_memory_store_id: str
+    output_memory_store_id: str | None = None
+    output_store_name: str
+    dreamer_session_id: str | None = None
+    dreamer_agent_id: str | None = None
+    session_filter: DreamSessionFilter
+    status: DreamStatus
+    error: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class DreamListResponse(BaseModel):
+    """Payload for ``GET /v1/dreams``."""
+
+    data: list[Dream]
+    has_more: bool
+    next_cursor: str | None = None
