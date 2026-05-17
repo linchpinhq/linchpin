@@ -637,11 +637,166 @@ class CreateSessionRequest(BaseModel):
         return value
 
 
+# ---------------------------------------------------------------------------
+# Multimodal content blocks (v0.5.0)
+# ---------------------------------------------------------------------------
+
+
+# Supported MIME types per block kind. Kept narrow so a typo doesn't silently
+# round-trip into a provider request and 4xx there. Anthropic's vision +
+# PDF support is the source-of-truth list; OpenRouter mirrors a subset.
+_IMAGE_MEDIA_TYPES: frozenset[str] = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+_DOCUMENT_MEDIA_TYPES: frozenset[str] = frozenset({
+    "application/pdf", "text/plain", "text/markdown",
+})
+
+
+class TextBlock(BaseModel):
+    """Plain-text content block."""
+
+    type: Literal["text"]
+    text: str
+
+
+class _Base64Source(BaseModel):
+    """Inline base64-encoded payload. The ``data`` field carries the
+    raw base64 string — the API doesn't decode it, just hands it to the
+    provider in whichever native shape that provider expects.
+    """
+
+    type: Literal["base64"]
+    media_type: str
+    data: str
+
+
+class _UrlSource(BaseModel):
+    """HTTP(S) URL the provider will fetch on the agent's behalf."""
+
+    type: Literal["url"]
+    url: str
+
+
+class _FileSource(BaseModel):
+    """Reference to a Files-API upload. The orchestrator resolves the
+    sha256 + storage path at send-time so token rotation / re-upload
+    on the same file_id always sees fresh bytes.
+    """
+
+    type: Literal["file"]
+    file_id: str
+
+
+ContentBlockSource = Annotated[
+    Annotated[_Base64Source, Tag("base64")]
+    | Annotated[_UrlSource, Tag("url")]
+    | Annotated[_FileSource, Tag("file")],
+    Discriminator("type"),
+]
+
+
+class ImageBlock(BaseModel):
+    """Image input block. Provider routing rejects the message if the
+    target model doesn't advertise vision support."""
+
+    type: Literal["image"]
+    source: ContentBlockSource
+
+    @field_validator("source")
+    @classmethod
+    def _check_media_type(cls, v: object) -> object:
+        # Reject unknown image media types at the API boundary so a
+        # downstream provider 4xx isn't the first signal.
+        media_type = getattr(v, "media_type", None)
+        if media_type and media_type not in _IMAGE_MEDIA_TYPES:
+            raise ValueError(
+                f"image media_type {media_type!r} not supported; "
+                f"expected one of {sorted(_IMAGE_MEDIA_TYPES)}"
+            )
+        return v
+
+
+class DocumentBlock(BaseModel):
+    """Document input block (PDF / plain text / markdown). Provider
+    routing rejects the message if the target model doesn't advertise
+    document support (typically Claude family only)."""
+
+    type: Literal["document"]
+    source: ContentBlockSource
+
+    @field_validator("source")
+    @classmethod
+    def _check_media_type(cls, v: object) -> object:
+        media_type = getattr(v, "media_type", None)
+        if media_type and media_type not in _DOCUMENT_MEDIA_TYPES:
+            raise ValueError(
+                f"document media_type {media_type!r} not supported; "
+                f"expected one of {sorted(_DOCUMENT_MEDIA_TYPES)}"
+            )
+        return v
+
+
+# Block types valid inside ``user.message.content[]``. The orchestrator's
+# legacy single-string ``content: "..."`` shape continues to be accepted
+# by ``user.message`` events for backwards compat.
+UserMessageBlock = Annotated[
+    Annotated[TextBlock, Tag("text")]
+    | Annotated[ImageBlock, Tag("image")]
+    | Annotated[DocumentBlock, Tag("document")],
+    Discriminator("type"),
+]
+
+
+def validate_user_message_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Validate the ``content`` field of a ``user.message`` event payload.
+
+    Backwards-compat: a plain string is accepted as before. A list is
+    validated block-by-block against the ``UserMessageBlock``
+    discriminator so a malformed image source / unknown block type
+    fails at the API boundary with a 422 rather than reaching the
+    provider as opaque JSON.
+    """
+    from pydantic import TypeAdapter
+
+    content = payload.get("content")
+    if content is None:
+        return payload
+    if isinstance(content, str):
+        return payload
+    if not isinstance(content, list):
+        raise ValueError(
+            "user.message.content must be a string or a list of content blocks"
+        )
+    adapter = TypeAdapter(UserMessageBlock)
+    for idx, block in enumerate(content):
+        try:
+            adapter.validate_python(block)
+        except Exception as exc:
+            raise ValueError(
+                f"user.message.content[{idx}] is invalid: {exc}"
+            ) from exc
+    return payload
+
+
 class EventPayload(BaseModel):
     """A single event inside a PostEventsRequest."""
 
     type: EventType
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def _check_user_message_blocks(
+        cls, v: dict[str, Any], info
+    ) -> dict[str, Any]:
+        # v0.5.0 — when the event is a user.message with structured
+        # content blocks, run the block-discriminator validator so a
+        # malformed block 422s at the API boundary instead of erroring
+        # downstream in the provider.
+        if (info.data or {}).get("type") == "user.message":
+            validate_user_message_payload(v)
+        return v
 
 
 class PostEventsRequest(BaseModel):
