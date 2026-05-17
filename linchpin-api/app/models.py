@@ -51,6 +51,15 @@ EVENT_TYPES: frozenset[str] = frozenset({
     "memory.write",                   # v0.3 PR4 — API or sandbox memory write
     "memory.write_rejected",          # v0.3 PR4 — sandbox over-cap rollback
     "memory.gc",                      # v0.3 PR5 — GC pass tombstoned versions
+    # Outcome events — v0.6
+    "session.outcome_evaluation_started",
+    "session.outcome_evaluation_ended",
+    # Multi-agent thread events — v0.6 (webhook event names already
+    # declared in v0.2, now fired by the runtime).
+    "agent.thread_create",
+    "session.thread_created",
+    "session.thread_idled",
+    "session.thread_terminated",
     # Span events — v0.2.0 item #9
     "span.model_request_start",
     "span.model_request_end",
@@ -83,6 +92,12 @@ EventType = Literal[
     "memory.write",
     "memory.write_rejected",
     "memory.gc",
+    "session.outcome_evaluation_started",
+    "session.outcome_evaluation_ended",
+    "agent.thread_create",
+    "session.thread_created",
+    "session.thread_idled",
+    "session.thread_terminated",
     "span.model_request_start",
     "span.model_request_end",
 ]
@@ -693,6 +708,7 @@ class CreateSessionRequest(BaseModel):
     ttl_seconds: int | None = None
     vault_ids: list[str] = Field(default_factory=list)
     resources: list["SessionResourceConfig"] = Field(default_factory=list)
+    outcome: "OutcomeDefinition | None" = None  # v0.6 — goal-driven sessions
 
     @field_validator("resources")
     @classmethod
@@ -937,6 +953,8 @@ class SessionResponse(BaseModel):
     usage: SessionUsage = Field(default_factory=SessionUsage)
     vault_ids: list[str] = Field(default_factory=list)
     resources: list["SessionResource"] = Field(default_factory=list)
+    outcome: "OutcomeDefinition | None" = None  # v0.6 — goal-driven sessions
+    parent_session_id: str | None = None  # v0.6 — set for thread sub-sessions
 
 
 class EventResponse(BaseModel):
@@ -1616,3 +1634,107 @@ class SkillListResponse(BaseModel):
     data: list[Skill]
     has_more: bool
     next_cursor: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Outcomes (v0.6.0)
+# ---------------------------------------------------------------------------
+
+
+# Numeric range the grader's per-criterion + aggregate score must land in.
+# Closed interval — 0.0 and 1.0 are both valid scores.
+OUTCOME_SCORE_MIN = 0.0
+OUTCOME_SCORE_MAX = 1.0
+
+# Cap on rubric size. Bigger rubrics push prompt tokens; the cap is
+# loose enough for any plausible rubric and tight enough to fence off a
+# pathological caller.
+MAX_RUBRIC_CRITERIA = 16
+MAX_CRITERION_LEN = 1024
+MAX_DEFINITION_LEN = 4096
+
+
+class RubricCriterion(BaseModel):
+    """A single line in the outcome rubric.
+
+    Each criterion has a free-text description and a 0..1 weight. The
+    weights across a rubric must sum to 1.0 (validated on the parent
+    ``OutcomeDefinition``) so the aggregate score the grader emits is
+    comparable across runs.
+    """
+
+    criterion: str = Field(min_length=1, max_length=MAX_CRITERION_LEN)
+    weight: float = Field(ge=0.0, le=1.0)
+
+
+class OutcomeAgentGrader(BaseModel):
+    """An agent-based grader (v0.6 default). The grader is itself a
+    Linchpin agent — a worker thread spawned against the parent
+    session's transcript that emits a score + rationale.
+    """
+
+    type: Literal["agent"]
+    agent_id: str
+
+
+# Grader discriminator. Currently only ``agent``; a deterministic
+# rubric grader could land later as ``{type: "deterministic", ...}``
+# without changing callers using ``type: "agent"``.
+OutcomeGrader = Annotated[
+    Annotated[OutcomeAgentGrader, Tag("agent")],
+    Discriminator("type"),
+]
+
+
+class OutcomeDefinition(BaseModel):
+    """The ``session.outcome`` declaration (v0.6.0).
+
+    Validates: definition non-empty + bounded, rubric non-empty +
+    bounded, criterion weights sum to 1.0, grader present.
+    """
+
+    definition: str = Field(min_length=1, max_length=MAX_DEFINITION_LEN)
+    rubric: list[RubricCriterion]
+    grader: OutcomeGrader
+    success_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    auto_terminate: bool = True
+
+    @field_validator("rubric")
+    @classmethod
+    def _bounded_and_weights_sum_to_one(
+        cls, v: list[RubricCriterion]
+    ) -> list[RubricCriterion]:
+        if not v:
+            raise ValueError("outcome.rubric must contain at least one criterion")
+        if len(v) > MAX_RUBRIC_CRITERIA:
+            raise ValueError(
+                f"outcome.rubric exceeds {MAX_RUBRIC_CRITERIA}-criterion cap "
+                f"(got {len(v)})"
+            )
+        total = sum(c.weight for c in v)
+        # Tolerate floating-point error around the sum-to-1 check —
+        # callers writing 0.5 + 0.3 + 0.2 shouldn't see a 422 because
+        # of binary representation drift.
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"outcome.rubric weights must sum to 1.0 (got {total:.6f})"
+            )
+        return v
+
+
+class OutcomeEvaluation(BaseModel):
+    """One row from the ``outcome_evaluations`` history table."""
+
+    id: str
+    session_id: str
+    grader_id: str | None = None
+    score: float
+    rationale: str | None = None
+    criteria: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime
+
+
+class OutcomeEvaluationsResponse(BaseModel):
+    """Payload for ``GET /v1/sessions/{id}/outcome_evaluations``."""
+
+    data: list[OutcomeEvaluation]

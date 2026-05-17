@@ -53,8 +53,12 @@ from app.models import (
     SessionUsage,
     GitRepositoryResource,
     GithubRepositoryResource,
+    OutcomeDefinition,
+    OutcomeEvaluation,
+    OutcomeEvaluationsResponse,
     VaultResource,
 )
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger("linchpin-api.sessions")
 
@@ -97,6 +101,23 @@ def _row_to_session(row, resources: list[SessionResource] | None = None) -> Sess
     else:
         vault_ids = vault_ids_raw
 
+    # v0.6 — outcome + parent_session_id. ``outcome`` is JSONB and may
+    # arrive as a dict or a JSON string; both are tolerated. Rows from
+    # pre-0013 schemas (no column) come back without the key.
+    keys = row.keys()
+    outcome_raw = row["outcome"] if "outcome" in keys else None
+    if isinstance(outcome_raw, str):
+        outcome_raw = json.loads(outcome_raw) if outcome_raw else None
+    outcome = (
+        OutcomeDefinition.model_validate(outcome_raw)
+        if outcome_raw is not None else None
+    )
+    parent_session_id = (
+        str(row["parent_session_id"])
+        if "parent_session_id" in keys and row["parent_session_id"] is not None
+        else None
+    )
+
     return SessionResponse(
         id=str(row["id"]),
         agent_id=str(row["agent_id"]),
@@ -115,6 +136,8 @@ def _row_to_session(row, resources: list[SessionResource] | None = None) -> Sess
         usage=SessionUsage(**usage),
         vault_ids=vault_ids,
         resources=resources or [],
+        outcome=outcome,
+        parent_session_id=parent_session_id,
     )
 
 
@@ -713,14 +736,59 @@ async def create_session(
         api_version = getattr(request.state, "api_version", V1)
         pinned_version: str | None = None if api_version == V1 else api_version
 
+        # v0.6 PR1 — validate the outcome grader agent exists + isn't
+        # archived (fail fast so the session row never lands pointing
+        # at a deleted grader). Persisted as JSONB on the sessions row.
+        outcome_json = None
+        if body.outcome is not None:
+            from app.models import OutcomeAgentGrader
+            grader = body.outcome.grader
+            if isinstance(grader, OutcomeAgentGrader):
+                try:
+                    grader_uid = uuid.UUID(grader.agent_id)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "validation_error",
+                            "message": f"Invalid outcome.grader.agent_id: {grader.agent_id}",
+                        },
+                    )
+                grader_row = await fetch_one(
+                    "SELECT id, archived_at FROM agents WHERE id = $1",
+                    grader_uid,
+                )
+                if grader_row is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "validation_error",
+                            "message": (
+                                f"outcome grader agent {grader.agent_id} not found"
+                            ),
+                        },
+                    )
+                if grader_row["archived_at"] is not None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "validation_error",
+                            "message": (
+                                f"outcome grader agent {grader.agent_id} is archived"
+                            ),
+                        },
+                    )
+            outcome_json = body.outcome.model_dump_json()
+
         row = await fetch_one(
             """
             INSERT INTO sessions
                 (id, agent_id, agent_version, environment_id, status,
                  container_id, title, metadata, ttl_seconds, vault_ids, stats, usage,
-                 linchpin_api_version)
+                 linchpin_api_version, outcome)
             VALUES ($1, $2, $3, $4, 'running',
-                    $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+                    $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12,
+                    $13::jsonb)
             RETURNING *
             """,
             uuid.UUID(session_id),
@@ -735,6 +803,7 @@ async def create_session(
             stats_json,
             usage_json,
             pinned_version,
+            outcome_json,
         )
 
         # Persist session_resources rows. State is 'mounted' for resources whose
@@ -1204,6 +1273,189 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
 
     resources = await _load_session_resources(uid)
     return _row_to_session(updated, resources=resources)
+
+
+# ---- v0.6 PR1 — outcome evaluations ----
+
+
+class _PostOutcomeEvaluation(BaseModel):
+    """Body shape for ``POST /v1/sessions/{id}/outcome_evaluations``.
+
+    Either the grader agent itself or an external caller can submit a
+    result. The route is the single canonical write path for outcome
+    evaluations — auto-termination + event emission both fan out from
+    here so a deterministic grader (future) and an agent grader (v0.6)
+    converge on identical session-side behavior.
+    """
+
+    score: float = Field(ge=0.0, le=1.0)
+    rationale: str | None = None
+    criteria: list[dict[str, object]] = Field(default_factory=list)
+    grader_id: str | None = None
+
+
+@router.post(
+    "/{session_id}/outcome_evaluations",
+    status_code=201,
+    response_model=OutcomeEvaluation,
+)
+async def post_outcome_evaluation(
+    session_id: str, body: _PostOutcomeEvaluation, request: Request
+) -> OutcomeEvaluation:
+    """Record a grader evaluation.
+
+    Auto-terminates the session when ``score >= outcome.success_threshold``
+    and the outcome declared ``auto_terminate: true`` (the default).
+    Emits ``session.outcome_evaluation_ended`` regardless of threshold.
+    """
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+    sess_row = await fetch_one("SELECT * FROM sessions WHERE id = $1", uid)
+    if sess_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+
+    grader_uid = None
+    if body.grader_id:
+        try:
+            grader_uid = uuid.UUID(body.grader_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"Invalid grader_id: {body.grader_id}",
+                },
+            )
+
+    eval_id = uuid.uuid4()
+    row = await fetch_one(
+        """
+        INSERT INTO outcome_evaluations
+            (id, session_id, grader_id, score, rationale, criteria)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        RETURNING *
+        """,
+        eval_id,
+        uid,
+        grader_uid,
+        body.score,
+        body.rationale,
+        json.dumps(body.criteria),
+    )
+
+    # Emit ``session.outcome_evaluation_ended`` so external listeners
+    # (webhooks, SSE) learn the result without polling.
+    try:
+        await append_event(
+            session_id,
+            "session.outcome_evaluation_ended",
+            {
+                "evaluation_id": str(eval_id),
+                "score": body.score,
+                "rationale": body.rationale,
+                "grader_id": body.grader_id,
+            },
+        )
+    except Exception:
+        logger.exception("failed to append session.outcome_evaluation_ended event")
+
+    # Auto-terminate when the score crosses the success threshold and
+    # the outcome opted into auto-termination. We pull the threshold
+    # off the row (not the request) so a malicious grader can't lower
+    # the bar by inlining their own.
+    outcome_raw = sess_row.get("outcome") if hasattr(sess_row, "get") else sess_row["outcome"]
+    if isinstance(outcome_raw, str):
+        outcome_raw = json.loads(outcome_raw) if outcome_raw else None
+    if outcome_raw:
+        threshold = float(outcome_raw.get("success_threshold", 0.8))
+        if outcome_raw.get("auto_terminate", True) and body.score >= threshold:
+            if sess_row["status"] != "terminated":
+                await execute(
+                    "UPDATE sessions SET status = 'terminated', updated_at = NOW() "
+                    "WHERE id = $1 AND status != 'terminated'",
+                    uid,
+                )
+                try:
+                    await append_event(
+                        session_id,
+                        "session.status_terminated",
+                        {
+                            "reason": "outcome_success",
+                            "score": body.score,
+                            "threshold": threshold,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to append session.status_terminated event after outcome success",
+                    )
+
+    return OutcomeEvaluation(
+        id=str(row["id"]),
+        session_id=str(row["session_id"]),
+        grader_id=str(row["grader_id"]) if row["grader_id"] is not None else None,
+        score=float(row["score"]),
+        rationale=row["rationale"],
+        criteria=(
+            json.loads(row["criteria"])
+            if isinstance(row["criteria"], str)
+            else (row["criteria"] or [])
+        ),
+        created_at=row["created_at"],
+    )
+
+
+@router.get(
+    "/{session_id}/outcome_evaluations",
+    response_model=OutcomeEvaluationsResponse,
+)
+async def list_outcome_evaluations(session_id: str) -> OutcomeEvaluationsResponse:
+    """Append-only history of grader evaluations for a session, newest
+    first. Empty list when no outcome was declared or no grader has
+    run yet."""
+    try:
+        uid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+    sess_row = await fetch_one("SELECT id FROM sessions WHERE id = $1", uid)
+    if sess_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {session_id} not found"},
+        )
+    rows = await fetch_all(
+        "SELECT * FROM outcome_evaluations WHERE session_id = $1 "
+        "ORDER BY created_at DESC",
+        uid,
+    )
+    data = [
+        OutcomeEvaluation(
+            id=str(r["id"]),
+            session_id=str(r["session_id"]),
+            grader_id=str(r["grader_id"]) if r["grader_id"] is not None else None,
+            score=float(r["score"]),
+            rationale=r["rationale"],
+            criteria=(
+                json.loads(r["criteria"])
+                if isinstance(r["criteria"], str)
+                else (r["criteria"] or [])
+            ),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return OutcomeEvaluationsResponse(data=data)
 
 
 @router.post("/{session_id}/archive", response_model=SessionResponse)
