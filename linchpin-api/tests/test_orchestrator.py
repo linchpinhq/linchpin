@@ -816,7 +816,7 @@ class TestClassifyTool:
         assert classify_tool("bash", agent) == "builtin"
 
     def test_mcp_tool(self):
-        from app.models import MCPServerConfig
+        from app.models import StdioMCPServerConfig as MCPServerConfig
         from app.orchestrator import classify_tool
 
         agent = _make_agent()
@@ -861,7 +861,7 @@ class TestDispatchToolMCP:
 
     @pytest.mark.asyncio
     async def test_mcp_tool_forwards_to_connector(self):
-        from app.models import MCPServerConfig
+        from app.models import StdioMCPServerConfig as MCPServerConfig
         from app.orchestrator import dispatch_tool
 
         agent = _make_agent()
@@ -889,7 +889,7 @@ class TestDispatchToolMCP:
 
     @pytest.mark.asyncio
     async def test_mcp_tool_error_from_connector(self):
-        from app.models import MCPServerConfig
+        from app.models import StdioMCPServerConfig as MCPServerConfig
         from app.orchestrator import dispatch_tool
 
         agent = _make_agent()
@@ -1078,7 +1078,7 @@ class TestRunSessionMCPToolUse:
 
     @pytest.mark.asyncio
     async def test_mcp_tool_emits_correct_events(self):
-        from app.models import MCPServerConfig
+        from app.models import StdioMCPServerConfig as MCPServerConfig
 
         agent = _make_agent(tools=[
             BuiltinToolConfig(
