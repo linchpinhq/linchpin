@@ -1131,7 +1131,9 @@ class PaginatedFilesResponse(BaseModel):
 # Session Resources (v0.2.0 — Resources framework, item #1)
 # ---------------------------------------------------------------------------
 
-SessionResourceType = Literal["file", "memory_store", "github_repository", "vault"]
+SessionResourceType = Literal[
+    "file", "memory_store", "github_repository", "git_repository", "vault",
+]
 SessionResourceState = Literal["mounted", "unmounting", "unmounted", "failed"]
 
 # Mount paths reserved by the platform — callers cannot mount resources here.
@@ -1209,13 +1211,42 @@ class MemoryStoreResource(BaseModel):
     instructions: str | None = None
 
 
+class GitRepositoryResource(BaseModel):
+    """Clone any HTTPS git remote into the sandbox (v0.5.0).
+
+    Generic by design — works with GitHub, GitLab, Bitbucket, Gitea,
+    any HTTPS git server — even though the most common pairing is the
+    GitHub MCP server. Tokens flow either inline via
+    ``authorization_token`` or, post-v0.5, through ``vault_ids`` (same
+    pattern as URL MCP servers).
+    """
+
+    type: Literal["git_repository"]
+    url: str
+    mount_path: str
+    authorization_token: str | None = None
+    branch: str | None = None
+    shallow: bool = True
+
+    @field_validator("mount_path")
+    @classmethod
+    def _validate_mount_path(cls, value: str) -> str:
+        return _validate_mount_path(value)
+
+
 class GithubRepositoryResource(BaseModel):
-    """Clone a GitHub repo into the sandbox. Reserved for v0.5 — rejected by v0.2 handlers."""
+    """Legacy alias for ``GitRepositoryResource`` (v0.2-v0.4 reserved
+    the ``github_repository`` type; v0.5 generalizes to
+    ``git_repository``). Accepted on input for backwards compat and
+    normalized to the generic form before dispatch.
+    """
 
     type: Literal["github_repository"]
     url: str
     mount_path: str
     authorization_token: str | None = None
+    branch: str | None = None
+    shallow: bool = True
 
     @field_validator("mount_path")
     @classmethod
@@ -1244,6 +1275,7 @@ class VaultResource(BaseModel):
 SessionResourceConfig = Annotated[
     Annotated[FileResource, Tag("file")]
     | Annotated[MemoryStoreResource, Tag("memory_store")]
+    | Annotated[GitRepositoryResource, Tag("git_repository")]
     | Annotated[GithubRepositoryResource, Tag("github_repository")]
     | Annotated[VaultResource, Tag("vault")],
     Discriminator("type"),
