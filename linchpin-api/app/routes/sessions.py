@@ -528,6 +528,79 @@ async def create_session(
             mode="rw" if resource.access == "read_write" else "ro",
         ))
 
+    # v0.4.0 — materialize the agent's skill bundles into per-session
+    # cache dirs and bind-mount each at /mnt/skills/<name>/ read-only.
+    # Skills are static-at-agent-time so they're resolved off the agent
+    # row (pinned via agent_version), not via resources[]. Failures here
+    # 500 — agents expect their skills to be present, unlike file
+    # resources where missing-host-path is recoverable.
+    skills_raw = agent_row["skills"] if "skills" in agent_row.keys() else []
+    if isinstance(skills_raw, str):
+        skill_ids: list[str] = json.loads(skills_raw)
+    else:
+        skill_ids = list(skills_raw or [])
+    attached_skills: list[dict[str, object]] = []
+    if skill_ids:
+        from app.skills import (
+            absolute_storage_path,
+            materialize_skill_bundle,
+        )
+        for sid in skill_ids:
+            try:
+                skill_uid = uuid.UUID(sid)
+            except ValueError:
+                logger.warning(
+                    "agent %s has malformed skill id %r; skipping",
+                    agent_uid, sid,
+                )
+                continue
+            skill_row = await fetch_one(
+                "SELECT id, name, description, bundle_sha256, archived_at "
+                "FROM skills WHERE id = $1",
+                skill_uid,
+            )
+            if skill_row is None or skill_row["archived_at"] is not None:
+                # Skill was deleted after the agent was last patched —
+                # log + skip so the session still boots. The metadata
+                # block omits the missing skill so the agent won't try
+                # to invoke it.
+                logger.warning(
+                    "skill %s missing or archived; session %s booting without it",
+                    sid, session_id,
+                )
+                continue
+            bundle_path = absolute_storage_path(skill_row["bundle_sha256"])
+            try:
+                cache_dir = await asyncio.to_thread(
+                    materialize_skill_bundle,
+                    bundle_path=bundle_path,
+                    session_id=session_id,
+                    skill_name=skill_row["name"],
+                )
+            except (FileNotFoundError, OSError) as exc:
+                logger.error(
+                    "materialize_skill_bundle failed (skill=%s, session=%s): %s",
+                    sid, session_id, exc,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "skill_materialize_failed",
+                        "message": (
+                            f"failed to materialize skill {sid} bundle: {exc}"
+                        ),
+                    },
+                ) from exc
+            mounts.append(ResourceMount(
+                host_path=cache_dir,
+                container_path=f"/mnt/skills/{skill_row['name']}",
+                mode="ro",
+            ))
+            attached_skills.append({
+                "name": skill_row["name"],
+                "description": skill_row["description"],
+            })
+
     # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
 
@@ -1044,6 +1117,14 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
         session_memory_cache_dir(session_id, "_placeholder")
     )
     await asyncio.to_thread(shutil.rmtree, memory_cache_root, True)
+
+    # v0.4.0 — wipe the per-session skills cache dir too. Skill bundles
+    # are regenerable from the canonical FileStore copies, so the
+    # extracted per-session tree is purely working state.
+    from app.skills import session_skills_root
+    await asyncio.to_thread(
+        shutil.rmtree, session_skills_root(session_id), True,
+    )
 
     # Drop the per-session events.append lock so the dict doesn't grow
     # unboundedly across the api process's lifetime.

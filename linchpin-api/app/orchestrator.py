@@ -271,6 +271,39 @@ async def _build_memory_system_block(session_id: uuid.UUID) -> str:
     return render_memory_system_prompt_block(stores)
 
 
+async def _build_skills_system_block(agent: Agent) -> str:
+    """v0.4.0 — render the ``<linchpin:skills>`` block. Skills are
+    static-at-agent-time so we read them off the agent object directly
+    (the agent passed into build_context is already pinned to the
+    session's agent_version snapshot) and look up each id in the
+    skills table for the live name + description.
+
+    Missing/archived skills are silently dropped — the materialization
+    loop in sessions.py logs the warning at boot; the system prompt
+    just omits them so the agent doesn't see ghost skills.
+    """
+    from app.skills import render_skills_system_prompt_block
+
+    skill_ids = list(agent.skills or [])
+    if not skill_ids:
+        return ""
+
+    rendered: list[dict[str, object]] = []
+    for sid in skill_ids:
+        try:
+            uid = uuid.UUID(sid)
+        except ValueError:
+            continue
+        row = await fetch_one(
+            "SELECT name, description, archived_at FROM skills WHERE id = $1",
+            uid,
+        )
+        if row is None or row["archived_at"] is not None:
+            continue
+        rendered.append({"name": row["name"], "description": row["description"]})
+    return render_skills_system_prompt_block(rendered)
+
+
 async def build_context(session_id: str, agent: Agent) -> list[dict]:
     """Build the conversation messages list from the session event log.
 
@@ -296,9 +329,12 @@ async def build_context(session_id: str, agent: Agent) -> list[dict]:
     # session, so the agent learns about its persistent state without
     # the caller having to manage prompts themselves.
     memory_block = await _build_memory_system_block(uid)
+    skills_block = await _build_skills_system_block(agent)
     base_system = agent.system or ""
-    if memory_block:
-        system = f"{memory_block}\n\n{base_system}".rstrip() if base_system else memory_block
+    prelude_parts = [part for part in (skills_block, memory_block) if part]
+    if prelude_parts:
+        prelude = "\n\n".join(prelude_parts)
+        system = f"{prelude}\n\n{base_system}".rstrip() if base_system else prelude
     else:
         system = base_system
     if system:
