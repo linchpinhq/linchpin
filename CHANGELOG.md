@@ -6,6 +6,46 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 _No unreleased changes yet._
 
+## [0.5.0] - 2026-05-16
+
+Multimodal content + Remote MCP + Git repositories. Three medium-sized features bundled into one minor that round out the resource and content surface. Three PRs.
+
+### Added
+
+#### Multimodal content blocks
+
+- **`user.message.content[]`** accepts text + image + document blocks alongside the legacy plain-string shape. Discriminator: `{type: "text" | "image" | "document"}`. Each non-text block carries a `source` whose own discriminator is `base64` / `url` / `file`.
+- **`ImageBlock`** — JPEG, PNG, GIF, WebP. Media-type allow-list rejects unknown types at the API boundary.
+- **`DocumentBlock`** — PDF, plain text, markdown. Provider routing decides whether the target model supports it.
+- **File-source resolution.** Orchestrator inlines `{source: {type: "file", file_id}}` blocks to base64 by reading bytes through the existing FileStore — providers never see Linchpin file ids.
+- **OpenRouter translation.** Image blocks rewrite to OpenAI's `image_url` shape; document blocks pass through verbatim so Claude-routed requests get Anthropic's native shape and other models surface clean upstream errors.
+
+#### Remote URL MCP transport
+
+- **`mcp_servers[]`** widens to a discriminated union: `StdioMCPServerConfig` (the existing v0.4 shape, now `type: "stdio"`, default) + new `UrlMCPServerConfig` (`type: "url"` with `url` + `vault_ids`).
+- **Legacy stdio config** (no `type` key) continues to validate — a `mode="before"` normalizer defaults to `stdio` so v0.4-era DB rows keep parsing without a migration.
+- **`linchpin-connector` MCPRemoteManager.** Mirrors the existing stdio manager's surface (`list_tools`, `invoke`, `stop_server`, `stop_all`). One `httpx.AsyncClient` per (session, server). JSON-RPC over POST handling both `application/json` and `text/event-stream` responses (MCP streamable HTTP transport).
+- **Credential-blind by design.** The connector receives the resolved Bearer token via headers from the API; it never reads vault contents directly.
+
+#### Git repository resource (real clone)
+
+- **`GitRepositoryResource`** (`type: "git_repository"`) — generic HTTPS git remote: `url`, `mount_path`, optional `authorization_token` / `branch` / `shallow` (default `true`). Works with GitHub, GitLab, Bitbucket, Gitea, any HTTPS remote.
+- **`GithubRepositoryResource` retained** as a legacy alias for v0.2-v0.4 clients; persisted rows canonicalize to `git_repository`.
+- **Per-environment cache.** `$LINCHPIN_GIT_CACHE_ROOT/<env_id>/<sha256(url + "@" + branch)>/`. Two sessions in the same env that mount the same (url, branch) share one on-disk clone.
+- **Cache hit refresh:** `git fetch` + `git checkout` + `git reset --hard origin/<branch>`. **Cache miss:** clone into `.tmp` then `os.replace` so a concurrent reader never sees a half-cloned tree.
+- **Token safety.** Embedded only during clone (`x-access-token:<tok>@host`), then the remote is rewritten to the clean URL so subsequent fetches and `git log` output don't leak the secret. Clone errors redact the token from stderr.
+- **session_resources rows** persist `url`, `branch`, `shallow`, and a `has_token: bool` ride-along — the token itself never reaches the row.
+- **Branch validation:** `[A-Za-z0-9_./-]+` so shell metacharacters can't slip past the subprocess.
+
+### Operator notes
+
+- `LINCHPIN_GIT_CACHE_ROOT` defaults to `/var/lib/linchpin/git_cache` — give it durable storage (clones are typically the largest single resource volume).
+- Per-(env, url, branch) cache entries are immutable in the cache-key sense; rotating the access token on a future session reuses the cache via `git fetch` + URL rewrite.
+
+### Schema migrations
+
+- None. Multimodal blocks ride on the existing `events.payload` JSONB column. MCP discriminator is a backwards-compat-friendly shape change on the existing `agents.mcp_servers` JSONB column. Git repository resource reuses the existing `session_resources` table.
+
 ## [0.4.0] - 2026-05-16
 
 Skills — packaged expertise that progressively discloses to the agent. Pairs with v0.3.0's Memory: Memory is history, Skills is expertise. Three PRs.
