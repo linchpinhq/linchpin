@@ -45,6 +45,12 @@ EVENT_TYPES: frozenset[str] = frozenset({
     "session.error",
     "session.requires_action",
     "session.resource_mount_failed",  # PR3 — D5
+    "session.memory_mount_failed",    # v0.3 PR4 — per-store memory mount failure
+    "session.deprecation_used",       # v0.3 PR6 — request used a deprecated shape
+    # Memory events — v0.3
+    "memory.write",                   # v0.3 PR4 — API or sandbox memory write
+    "memory.write_rejected",          # v0.3 PR4 — sandbox over-cap rollback
+    "memory.gc",                      # v0.3 PR5 — GC pass tombstoned versions
     # Span events — v0.2.0 item #9
     "span.model_request_start",
     "span.model_request_end",
@@ -72,6 +78,11 @@ EventType = Literal[
     "session.error",
     "session.requires_action",
     "session.resource_mount_failed",
+    "session.memory_mount_failed",
+    "session.deprecation_used",
+    "memory.write",
+    "memory.write_rejected",
+    "memory.gc",
     "span.model_request_start",
     "span.model_request_end",
 ]
