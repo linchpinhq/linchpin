@@ -74,6 +74,17 @@ async def lifespan(app: FastAPI):
     )
     app.state.ttl_cleanup_task = ttl_task
 
+    # v0.3 PR5 — memory version GC task. Hourly by default; controlled
+    # by LINCHPIN_MEMORY_GC_INTERVAL_SEC. Skipped when LINCHPIN_MEMORY_GC=false
+    # for test/maintenance windows that don't want the cron tick at all.
+    if os.environ.get("LINCHPIN_MEMORY_GC", "true").lower() != "false":
+        from app.memory import cleanup_expired_memory_versions
+        app.state.memory_gc_task = asyncio.create_task(
+            cleanup_expired_memory_versions()
+        )
+    else:
+        app.state.memory_gc_task = None
+
     # v0.2.0 item #14 — webhook delivery worker. One per process; uses
     # SELECT … FOR UPDATE SKIP LOCKED so multi-process deployments are
     # safe out of the box. ``LINCHPIN_WEBHOOKS_WORKER=false`` skips it
@@ -121,6 +132,15 @@ async def lifespan(app: FastAPI):
         wht.cancel()
         try:
             await wht
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # v0.3 PR5 — cancel memory GC task if running.
+    mgt = getattr(app.state, "memory_gc_task", None)
+    if mgt is not None:
+        mgt.cancel()
+        try:
+            await mgt
         except (asyncio.CancelledError, Exception):
             pass
 

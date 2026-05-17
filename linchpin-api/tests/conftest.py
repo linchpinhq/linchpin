@@ -76,6 +76,10 @@ def _set_api_key(monkeypatch: pytest.MonkeyPatch):
     # doesn't try to POST anywhere. Individual tests that want to
     # exercise the worker monkeypatch this back on.
     monkeypatch.setenv("LINCHPIN_WEBHOOKS_WORKER", "false")
+    # v0.3 PR5 — skip the memory GC cron in tests so the loop doesn't
+    # tick during a `with TestClient(app)` lifespan. Tests that
+    # exercise GC directly call ``run_memory_gc()``.
+    monkeypatch.setenv("LINCHPIN_MEMORY_GC", "false")
 
 
 @pytest.fixture()
