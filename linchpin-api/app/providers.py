@@ -160,6 +160,69 @@ async def _read_stream_body(resp: httpx.Response) -> str:
     return _extract_openrouter_error(resp)
 
 
+def _block_to_openai(block: dict) -> dict | None:
+    """Translate a Linchpin content block to its OpenAI Chat Completions
+    counterpart. Returns ``None`` for blocks we don't know how to map —
+    the caller drops them so the provider sees a clean ``content[]``.
+
+    OpenRouter routes Linchpin's three image source shapes (base64,
+    url, file) into the OpenAI ``image_url`` block. ``file`` source is
+    resolved up the stack before this helper sees it; if it's still
+    present here, we keep it as-is so the upstream test mocks can
+    assert the raw shape.
+    """
+    btype = block.get("type")
+    if btype == "text":
+        return {"type": "text", "text": block.get("text", "")}
+    if btype == "image":
+        src = block.get("source") or {}
+        if src.get("type") == "url":
+            return {"type": "image_url", "image_url": {"url": src.get("url", "")}}
+        if src.get("type") == "base64":
+            media_type = src.get("media_type", "image/png")
+            data = src.get("data", "")
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{media_type};base64,{data}"},
+            }
+        # file source — propagate verbatim; the orchestrator should have
+        # resolved it to inline bytes before send. Surface as-is so a
+        # test can spot the un-resolved leak.
+        return {"type": "image_url", "image_url": src}
+    if btype == "document":
+        # OpenRouter doesn't have a portable document block shape; pass
+        # the Linchpin block through verbatim so Claude-routed requests
+        # work (Anthropic accepts ``{type: "document", ...}``) and
+        # non-Anthropic models surface a clean upstream error.
+        return block
+    # Unknown block kind — drop. Pydantic's discriminator should have
+    # rejected this at the API boundary, so reaching here is a bug.
+    return None
+
+
+def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
+    """Walk the message list and translate any structured-content
+    ``content: [...]`` field into the OpenAI shape. String content is
+    untouched. Returns a new list — the caller's messages are not
+    mutated.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_content: list[dict] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                translated = _block_to_openai(block)
+                if translated is not None:
+                    new_content.append(translated)
+            out.append({**msg, "content": new_content})
+        else:
+            out.append(msg)
+    return out
+
+
 def _convert_tools_to_openai(tools: list[dict]) -> list[dict]:
     """Convert Linchpin tool definitions to OpenAI function-calling format."""
     return [
@@ -260,7 +323,7 @@ class OpenRouterProvider:
     ) -> dict:
         body: dict = {
             "model": config.id,
-            "messages": messages,
+            "messages": _convert_messages_for_openai(messages),
         }
         if tools:
             body["tools"] = _convert_tools_to_openai(tools)

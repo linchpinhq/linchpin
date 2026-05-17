@@ -271,6 +271,65 @@ async def _build_memory_system_block(session_id: uuid.UUID) -> str:
     return render_memory_system_prompt_block(stores)
 
 
+async def _resolve_file_sources(content_blocks: list) -> list:
+    """v0.5.0 — resolve ``source: {type: "file", file_id}`` shapes to
+    inline ``base64`` blocks by reading bytes through the FileStore.
+
+    Provider adapters don't speak Linchpin file ids; resolving here
+    keeps them simple. A missing/archived file_id is left as-is so the
+    provider error surfaces, mirroring the spec's "trust the provider"
+    posture for unsupported combos.
+    """
+    import base64
+
+    from app.files import get_file_store
+
+    resolved: list = []
+    fs = None
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            resolved.append(block)
+            continue
+        source = block.get("source")
+        if not isinstance(source, dict) or source.get("type") != "file":
+            resolved.append(block)
+            continue
+        file_id = source.get("file_id")
+        if not file_id:
+            resolved.append(block)
+            continue
+        try:
+            file_uid = uuid.UUID(str(file_id))
+        except ValueError:
+            resolved.append(block)
+            continue
+        row = await fetch_one(
+            "SELECT content_type, storage_path FROM files "
+            "WHERE id = $1 AND archived_at IS NULL",
+            file_uid,
+        )
+        if row is None:
+            resolved.append(block)
+            continue
+        if fs is None:
+            fs = get_file_store()
+        try:
+            with open(fs.absolute_path(row["storage_path"]), "rb") as f:
+                raw = f.read()
+        except OSError:
+            resolved.append(block)
+            continue
+        encoded = base64.b64encode(raw).decode("ascii")
+        new_block = dict(block)
+        new_block["source"] = {
+            "type": "base64",
+            "media_type": row["content_type"] or "application/octet-stream",
+            "data": encoded,
+        }
+        resolved.append(new_block)
+    return resolved
+
+
 async def _build_skills_system_block(agent: Agent) -> str:
     """v0.4.0 — render the ``<linchpin:skills>`` block. Skills are
     static-at-agent-time so we read them off the agent object directly
@@ -347,7 +406,16 @@ async def build_context(session_id: str, agent: Agent) -> list[dict]:
             payload = json.loads(payload)
 
         if event_type == "user.message":
-            messages.append({"role": "user", "content": payload.get("content", "")})
+            # v0.5.0 — pass content blocks through verbatim so providers
+            # can route to multimodal-capable models. Legacy plain-string
+            # callers continue to work; the orchestrator does not
+            # rewrite their shape. File-source resolution happens here
+            # so providers see inline bytes rather than Linchpin-specific
+            # file_id references.
+            content = payload.get("content", "")
+            if isinstance(content, list):
+                content = await _resolve_file_sources(content)
+            messages.append({"role": "user", "content": content})
 
         elif event_type == "agent.message":
             messages.append({"role": "assistant", "content": payload.get("content", "")})
