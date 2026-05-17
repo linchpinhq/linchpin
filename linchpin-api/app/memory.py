@@ -304,3 +304,100 @@ def precondition_failed_response(exc: PreconditionFailed) -> HTTPException:
             "actual_sha256": exc.actual,
         },
     )
+
+
+def max_stores_per_session() -> int:
+    """Mirrors Anthropic's max-8 default. Configurable so tests can pin
+    a smaller value without monkeypatching imports."""
+    raw = os.environ.get("LINCHPIN_MEMORY_MAX_STORES_PER_SESSION", "8")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
+def session_memory_cache_dir(session_id: str, store_name: str) -> str:
+    """Host-side cache dir where a memory store is materialized for a
+    session. Bind-mounted into the container at ``/mnt/memory/<name>/``.
+
+    PR4 will add the watcher that mirrors agent writes here back to the
+    canonical FileStore; PR3 just materializes the read-side.
+    """
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    return os.path.join(
+        tmp, "linchpin-sessions", session_id, "memory", store_name
+    )
+
+
+async def materialize_memory_store(
+    *,
+    session_id: str,
+    memory_store_id: uuid.UUID,
+    store_name: str,
+) -> str:
+    """Hydrate the store's tree into the per-session host cache dir
+    and return the dir path. Files written here are bind-mounted into
+    the sandbox at ``/mnt/memory/<store_name>/``.
+
+    The materialization reads from the canonical FileStore for each
+    memory's current head sha. PR4's watcher mirrors changes the other
+    way (sandbox → FileStore + DB).
+    """
+    from pathlib import Path
+
+    from app.db import fetch_all
+
+    cache_dir = Path(session_memory_cache_dir(session_id, store_name))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    memories = await fetch_all(
+        """
+        SELECT path, content_sha256
+        FROM memories
+        WHERE memory_store_id = $1 AND deleted_at IS NULL
+        ORDER BY path
+        """,
+        memory_store_id,
+    )
+
+    fs = LocalFileStore(root=memory_store_root())
+    for mem in memories:
+        path = mem["path"]
+        sha = mem["content_sha256"]
+        # storage_path layout: <sha[:2]>/<sha[2:4]>/<sha>
+        storage_path = f"{sha[:2]}/{sha[2:4]}/{sha}"
+        target = cache_dir / path.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(target, "wb") as out:
+                for chunk in fs.read(storage_path):
+                    out.write(chunk)
+        except FileNotFoundError:
+            # Storage row missing — leave a zero-byte placeholder so the
+            # mount layout matches the memory chain, but log loudly.
+            target.write_bytes(b"")
+    return str(cache_dir)
+
+
+def render_memory_system_prompt_block(
+    stores: list[dict[str, object]],
+) -> str:
+    """Render the auto-injected ``<linchpin:memory>`` system prompt block.
+
+    Each entry in ``stores`` carries ``name``, ``access``, ``description``,
+    and ``instructions``. Empty list → empty string (no block to inject).
+    """
+    if not stores:
+        return ""
+    lines = ["<linchpin:memory>"]
+    lines.append("The following memory stores are mounted into this session:")
+    lines.append("")
+    for s in stores:
+        name = s.get("name", "")
+        access = s.get("access", "read_only")
+        instructions = s.get("instructions") or s.get("description") or "<no instructions>"
+        lines.append(
+            f"- /mnt/memory/{name}/  ({access}) — {instructions}"
+        )
+    lines.append("</linchpin:memory>")
+    return "\n".join(lines)

@@ -1,4 +1,4 @@
-"""Unit tests for the Session Resources framework (v0.2.0 PR2).
+"""Unit tests for the Session Resources framework (v0.2.0 PR2 + v0.3 PR3).
 
 Covers:
 - SessionResourceConfig discriminator: every valid + reject shapes.
@@ -6,10 +6,14 @@ Covers:
 - Within-request uniqueness of mount_path.
 - POST /v1/sessions resources[] persistence:
     - type=file file_id existence + source=upload check.
-    - memory_store / github_repository rejected as not_implemented.
+    - type=memory_store store lookup, cap, dedupe, materialization wiring (v0.3 PR3).
+    - github_repository still rejected as not_implemented (v0.5).
 - SessionResponse hydrates resources[] (always populated, empty list when none).
 
-PR2 does NOT exercise sandbox mounting or live CRUD — those land in PR3 / PR4.
+PR3 (v0.3) wires memory_store into session creation: orchestrator's
+<linchpin:memory> system-prompt block + per-session host cache via
+materialize_memory_store. The actual sandbox bind + writer-side watcher
+land in PR4.
 """
 
 from __future__ import annotations
@@ -487,22 +491,46 @@ def test_create_session_invalid_file_uuid_rejected(mock_fetch_one, mock_fetch_al
 
 
 # ---------------------------------------------------------------------------
-# Deferred types: memory_store + github_repository → 422 not_implemented
+# memory_store dispatch (v0.3 PR3)
 # ---------------------------------------------------------------------------
 
 
+def _make_memory_store_row(*, store_id: str | None = None, name: str = "preferences", archived: bool = False):
+    """Minimal memory_stores row shape used by sessions.py validation."""
+    return {
+        "id": uuid.UUID(store_id) if store_id else uuid.uuid4(),
+        "name": name,
+        "description": "Session preferences",
+        "archived_at": datetime(2025, 1, 1, tzinfo=timezone.utc) if archived else None,
+    }
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_memory_store_resource_returns_not_implemented(
-    mock_fetch_one, mock_fetch_all, sandbox_client
+def test_memory_store_resource_persists_and_materializes(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
 ):
     client, _ = sandbox_client
     agent_id = str(uuid.uuid4())
     env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
 
     mock_fetch_one.side_effect = [
         _make_agent_row(agent_id=agent_id),
         _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id, name="preferences"),
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=session_id,
+            mount_path="/mnt/memory/preferences",
+            config={
+                "memory_store_id": store_id,
+                "access": "read_only",
+                "instructions": "Read user preferences before responding.",
+            },
+        ) | {"type": "memory_store"},
     ]
     mock_fetch_all.return_value = []
 
@@ -510,14 +538,160 @@ def test_memory_store_resource_returns_not_implemented(
         "agent_id": agent_id,
         "environment_id": env_id,
         "resources": [
-            {"type": "memory_store", "memory_store_id": "mem_1"},
+            {
+                "type": "memory_store",
+                "memory_store_id": store_id,
+                "access": "read_only",
+                "instructions": "Read user preferences before responding.",
+            },
         ],
     }
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
-    # 501 Not Implemented is the correct HTTP status — the request is well-
-    # formed; the server just doesn't implement this resource type yet.
-    assert resp.status_code == 501
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 201, resp.text
+    # Hydration was triggered before container create — PR4 will turn this
+    # into a real bind; PR3 only needs the host cache to exist + the row.
+    mock_materialize.assert_awaited_once()
+    materialize_kwargs = mock_materialize.await_args.kwargs
+    assert materialize_kwargs["store_name"] == "preferences"
+    assert str(materialize_kwargs["memory_store_id"]) == store_id
+    # The persisted resource carries the canonical /mnt/memory/<name> path
+    # and the full config (memory_store_id, access, instructions).
+    resources = resp.json()["resources"]
+    assert len(resources) == 1
+    assert resources[0]["type"] == "memory_store"
+    assert resources[0]["mount_path"] == "/mnt/memory/preferences"
+    assert resources[0]["config"]["memory_store_id"] == store_id
+    assert resources[0]["config"]["access"] == "read_only"
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_resource_not_found_returns_422(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        None,  # memory_stores lookup misses
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "validation_error"
+    assert "not found" in resp.json()["detail"]["message"]
+    mock_materialize.assert_not_awaited()
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_archived_returns_422(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id, archived=True),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+    assert "archived" in resp.json()["detail"]["message"]
+    mock_materialize.assert_not_awaited()
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_duplicate_id_in_request_returns_422(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id),
+        # No second memory_stores lookup expected — dedupe trips first.
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id},
+            {"type": "memory_store", "memory_store_id": store_id},
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+    assert "more than once" in resp.json()["detail"]["message"]
+    mock_materialize.assert_not_awaited()
+
+
+@patch.dict("os.environ", {"LINCHPIN_MEMORY_MAX_STORES_PER_SESSION": "2"})
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_cap_exceeded_returns_422(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_ids = [str(uuid.uuid4()) for _ in range(3)]
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_ids[0], name="a"),
+        _make_memory_store_row(store_id=store_ids[1], name="b"),
+        _make_memory_store_row(store_id=store_ids[2], name="c"),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": sid} for sid in store_ids
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+    assert resp.status_code == 422
+    assert "cap is 2" in resp.json()["detail"]["message"]
+    mock_materialize.assert_not_awaited()
 
 
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)

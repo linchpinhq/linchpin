@@ -27,6 +27,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.db import fetch_all, fetch_one, execute, listen, notify
 from app.events import append_event, decode_cursor, get_events, release_session_event_lock
 from app.files import get_file_store
+from app.memory import materialize_memory_store, max_stores_per_session
 from app.orchestrator import run_session
 from app.sandbox import DEFAULT_BASE_IMAGE, ResourceMount, SandboxError
 from app.streaming import get_stream
@@ -36,6 +37,7 @@ from app.models import (
     EnvironmentPackages,
     EventResponse,
     FileResource,
+    MemoryStoreResource,
     PaginatedEventsResponse,
     PaginatedListResponse,
     PostEventsRequest,
@@ -202,76 +204,156 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                     },
                 )
 
-    # Validate resources[] — for v0.2 only type=file is dispatchable; the other
-    # types parse cleanly but are rejected here as not_implemented per the tech
-    # spec. File resources must reference an existing, unarchived upload (not a
+    # Validate resources[] — v0.3 adds memory_store dispatch. `file` and
+    # `memory_store` are accepted; `github_repository` still 501s. File
+    # resources must reference an existing, unarchived upload (not a
     # deliverable — re-mounting deliverables across sessions would be a covert
     # channel; explicit re-upload is required).
     #
-    # PR3 closes PR2's TOCTOU note: the upfront validation block here checks
-    # existence + source + storage_path. The mount-time re-check below catches
-    # the narrow race between this block and container creation (file deleted
-    # between the two) and transitions the resource to state='failed' with a
-    # session.resource_mount_failed event — the spec's "session still starts"
-    # path.
-    file_meta: list[dict[str, Any]] = []  # parallel to body.resources
+    # PR3 closes PR2's TOCTOU note for files: the upfront validation block here
+    # checks existence + source + storage_path. The mount-time re-check below
+    # catches the narrow race between this block and container creation (file
+    # deleted between the two) and transitions the resource to state='failed'
+    # with a session.resource_mount_failed event — the spec's "session still
+    # starts" path.
+    #
+    # Memory stores are looked up here too; failures (missing/archived store,
+    # cap exceeded, duplicate store_id in the same request) fail the whole
+    # create — they're not deferrable the way a missing file is, because we
+    # need the store row to materialize the host cache and to emit the system
+    # prompt block before the agent runs.
+    file_meta: list[dict[str, Any] | None] = []   # parallel; None for non-file
+    memory_meta: list[dict[str, Any] | None] = [] # parallel; None for non-memory
+    seen_memory_store_ids: set[str] = set()
     for resource in body.resources:
-        if not isinstance(resource, FileResource):
+        if isinstance(resource, FileResource):
+            try:
+                file_uid = uuid.UUID(resource.file_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Invalid file id: {resource.file_id}",
+                    },
+                )
+            file_row = await fetch_one(
+                "SELECT id, source, archived_at, storage_path FROM files WHERE id = $1",
+                file_uid,
+            )
+            if file_row is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"File {resource.file_id} not found",
+                    },
+                )
+            if file_row["archived_at"] is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"File {resource.file_id} is archived",
+                    },
+                )
+            if file_row["source"] != "upload":
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": (
+                            f"File {resource.file_id} has source='{file_row['source']}'; "
+                            "only uploads can be mounted as session resources"
+                        ),
+                    },
+                )
+            file_meta.append({
+                "file_uid": file_uid,
+                "storage_path": file_row["storage_path"],
+            })
+            memory_meta.append(None)
+        elif isinstance(resource, MemoryStoreResource):
+            try:
+                store_uid = uuid.UUID(resource.memory_store_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Invalid memory_store id: {resource.memory_store_id}",
+                    },
+                )
+            # Dedupe by canonical UUID form so callers can't bypass the check
+            # via dashes/case/braces variations on the same id.
+            canonical_id = str(store_uid)
+            if canonical_id in seen_memory_store_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": (
+                            f"memory_store {canonical_id} appears more than once in "
+                            "resources[]; attach each store at most once per session"
+                        ),
+                    },
+                )
+            seen_memory_store_ids.add(canonical_id)
+            store_row = await fetch_one(
+                "SELECT id, name, description, archived_at "
+                "FROM memory_stores WHERE id = $1",
+                store_uid,
+            )
+            if store_row is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Memory store {canonical_id} not found",
+                    },
+                )
+            if store_row["archived_at"] is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_error",
+                        "message": f"Memory store {canonical_id} is archived",
+                    },
+                )
+            file_meta.append(None)
+            memory_meta.append({
+                "store_uid": store_uid,
+                "name": store_row["name"],
+                "description": store_row["description"],
+            })
+        else:
             raise HTTPException(
                 status_code=501,
                 detail={
                     "error": "not_implemented",
                     "message": (
-                        f"resource type '{resource.type}' is not supported in v0.2; "
-                        "only 'file' is dispatchable in this release"
+                        f"resource type '{resource.type}' is not supported in v0.3; "
+                        "only 'file' and 'memory_store' are dispatchable in this release"
                     ),
                 },
             )
-        try:
-            file_uid = uuid.UUID(resource.file_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "validation_error",
-                    "message": f"Invalid file id: {resource.file_id}",
-                },
-            )
-        file_row = await fetch_one(
-            "SELECT id, source, archived_at, storage_path FROM files WHERE id = $1",
-            file_uid,
+
+    # Per-session memory-store cap — mirrors Anthropic's max-8 default
+    # (overridable via LINCHPIN_MEMORY_MAX_STORES_PER_SESSION). Enforce after
+    # the validation loop so the error message reports the actual count.
+    memory_resource_count = sum(1 for m in memory_meta if m is not None)
+    cap = max_stores_per_session()
+    if memory_resource_count > cap:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "validation_error",
+                "message": (
+                    f"session has {memory_resource_count} memory_store resources; "
+                    f"cap is {cap} per session"
+                ),
+            },
         )
-        if file_row is None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "validation_error",
-                    "message": f"File {resource.file_id} not found",
-                },
-            )
-        if file_row["archived_at"] is not None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "validation_error",
-                    "message": f"File {resource.file_id} is archived",
-                },
-            )
-        if file_row["source"] != "upload":
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "validation_error",
-                    "message": (
-                        f"File {resource.file_id} has source='{file_row['source']}'; "
-                        "only uploads can be mounted as session resources"
-                    ),
-                },
-            )
-        file_meta.append({
-            "file_uid": file_uid,
-            "storage_path": file_row["storage_path"],
-        })
 
     # Determine network from environment config
     env_config = env_row["config"]
@@ -291,21 +373,30 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     # exists. FileStore is lazy-initialized only when there are resources to
     # mount so v0.1-shape session creates (no resources) don't trigger a
     # mkdir on LINCHPIN_FILES_ROOT.
+    #
+    # Memory stores skip this loop entirely — PR3 only registers them in
+    # session_resources and materializes the host cache (below). PR4 turns
+    # that cache into an actual sandbox bind + adds the per-store watcher.
     mounts: list[ResourceMount] = []
     resource_states: list[tuple[str, str | None]] = []  # parallel to body.resources
     seen_host_paths: dict[str, str] = {}  # host_path -> mount_path of first claimant
-    file_store = get_file_store() if body.resources else None
+    has_file_resource = any(isinstance(r, FileResource) for r in body.resources)
+    file_store = get_file_store() if has_file_resource else None
     for idx, resource in enumerate(body.resources):
         if not isinstance(resource, FileResource):
-            # Belt-and-suspenders: the 501 raise above already rejects non-file
-            # types. Explicit raise (not assert) so `python -O` doesn't strip
-            # the guard if a future refactor reorders validation and mount build.
-            raise RuntimeError(
-                f"unexpected resource type {type(resource).__name__} reached mount-build loop"
-            )
+            # memory_store rows are recorded after the session row exists;
+            # github_repository is rejected upstream. Anything else here is
+            # a bug, not a runtime input.
+            resource_states.append(("mounted", None))
+            continue
         if file_store is None:
-            raise RuntimeError("file_store unexpectedly None despite non-empty resources")
+            raise RuntimeError("file_store unexpectedly None despite file resource present")
         meta = file_meta[idx]
+        if meta is None:
+            raise RuntimeError(
+                f"file_meta[{idx}] is None but resource is FileResource — "
+                "validation/mount-build loops are out of step"
+            )
         host_path = file_store.absolute_path(meta["storage_path"])
         # Refuse two resources that resolve to the same backing host_path —
         # the FileStore is content-addressed so two distinct file_ids whose
@@ -356,6 +447,44 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         container_path="/mnt/session/outputs",
         mode="rw",
     ))
+
+    # v0.3 PR3 — materialize each attached memory_store into its per-session
+    # host cache dir before container create. PR4 will turn these dirs into
+    # bind mounts at /mnt/memory/<name>/; PR3 just hydrates the read-side and
+    # records the resource so the orchestrator's <linchpin:memory> system-
+    # prompt block can describe them to the agent. We materialize before
+    # container create so a hydration failure (disk full, bad storage row)
+    # 500s cleanly with no orphan container or DB state to roll back.
+    for idx, resource in enumerate(body.resources):
+        if not isinstance(resource, MemoryStoreResource):
+            continue
+        meta = memory_meta[idx]
+        if meta is None:
+            raise RuntimeError(
+                f"memory_meta[{idx}] is None but resource is MemoryStoreResource — "
+                "validation/materialize loops are out of step"
+            )
+        try:
+            await materialize_memory_store(
+                session_id=session_id,
+                memory_store_id=meta["store_uid"],
+                store_name=meta["name"],
+            )
+        except OSError as exc:
+            logger.error(
+                "materialize_memory_store failed (session=%s, store=%s): %s",
+                session_id, meta["store_uid"], exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "memory_materialize_failed",
+                    "message": (
+                        f"failed to hydrate memory store {meta['store_uid']} "
+                        f"into per-session cache: {exc}"
+                    ),
+                },
+            ) from exc
 
     # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
@@ -446,21 +575,44 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         )
 
         # Persist session_resources rows. State is 'mounted' for resources whose
-        # bind was added to the container; 'failed' (with error) for resources
+        # bind was added to the container (file) or whose host cache was
+        # materialized (memory_store); 'failed' (with error) for file resources
         # whose host_path went missing between validation and mount.
         resources: list[SessionResource] = []
         failed_resources: list[tuple[uuid.UUID, str, str]] = []  # (resource_id, mount_path, error)
         for idx, resource in enumerate(body.resources):
-            if not isinstance(resource, FileResource):
+            if isinstance(resource, FileResource):
+                state, error = resource_states[idx]
+                # Persist canonical UUID form (str(uuid.UUID(x))) so the DELETE 409
+                # mount-conflict check (which uses str(file_uid) on the URL-supplied
+                # id) matches regardless of whether the original POST sent the file
+                # id with dashes, without dashes, in uppercase, or braced.
+                resource_type = resource.type
+                resource_mount_path = resource.mount_path
+                config_json = json.dumps({"file_id": str(uuid.UUID(resource.file_id))})
+            elif isinstance(resource, MemoryStoreResource):
+                meta = memory_meta[idx]
+                if meta is None:
+                    raise RuntimeError(
+                        f"memory_meta[{idx}] is None at persist time — "
+                        "validation/persist loops are out of step"
+                    )
+                state, error = "mounted", None
+                resource_type = resource.type
+                # /mnt/memory/<store-name>/ is the canonical container-side
+                # path PR4 will bind to. We persist it now so the orchestrator
+                # block + REST responses can reference the path without
+                # round-tripping memory_stores.
+                resource_mount_path = f"/mnt/memory/{meta['name']}"
+                config_json = json.dumps({
+                    "memory_store_id": str(meta["store_uid"]),
+                    "access": resource.access,
+                    "instructions": resource.instructions,
+                })
+            else:
                 raise RuntimeError(
                     f"unexpected resource type {type(resource).__name__} reached persist loop"
                 )
-            state, error = resource_states[idx]
-            # Persist canonical UUID form (str(uuid.UUID(x))) so the DELETE 409
-            # mount-conflict check (which uses str(file_uid) on the URL-supplied
-            # id) matches regardless of whether the original POST sent the file
-            # id with dashes, without dashes, in uppercase, or braced.
-            config_json = json.dumps({"file_id": str(uuid.UUID(resource.file_id))})
             # Terminal states ('failed', 'unmounted') require unmounted_at per
             # the session_resources_terminal_has_unmounted_at CHECK in
             # migration 0004. Set unmounted_at=now() for pre-mount failures.
@@ -473,8 +625,8 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                 RETURNING *
                 """,
                 uuid.UUID(session_id),
-                resource.type,
-                resource.mount_path,
+                resource_type,
+                resource_mount_path,
                 config_json,
                 state,
                 error,
@@ -482,7 +634,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
             )
             resources.append(_row_to_resource(resource_row))
             if state == "failed":
-                failed_resources.append((resource_row["id"], resource.mount_path, error or ""))
+                failed_resources.append((resource_row["id"], resource_mount_path, error or ""))
 
         # Emit session.resource_mount_failed events for any pre-mount failures.
         # The session row is in place by this point so the events table's FK
