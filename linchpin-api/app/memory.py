@@ -13,7 +13,9 @@ can't reach into the Files API's content-addressed layout.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -22,8 +24,10 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
-from app.db import execute, fetch_one
+from app.db import execute, fetch_all, fetch_one
 from app.files import FileStore, LocalFileStore
+
+logger = logging.getLogger("linchpin-api.memory")
 from app.models import (
     MEMORY_MAX_BYTES_PER_MEMORY,
     ContentShaPrecondition,
@@ -377,6 +381,130 @@ async def materialize_memory_store(
             # mount layout matches the memory chain, but log loudly.
             target.write_bytes(b"")
     return str(cache_dir)
+
+
+def memory_gc_interval_seconds() -> int:
+    """Memory GC cron interval (default 1h). Configurable for tests +
+    operators with long-tail retention requirements."""
+    raw = os.environ.get("LINCHPIN_MEMORY_GC_INTERVAL_SEC", "3600")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3600
+
+
+def memory_gc_batch_size() -> int:
+    """Cap per-pass to keep one tick from monopolizing the connection
+    pool. Spec calls for 5000."""
+    raw = os.environ.get("LINCHPIN_MEMORY_GC_BATCH_SIZE", "5000")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 5000
+
+
+async def run_memory_gc(*, batch_size: int | None = None) -> dict[str, int]:
+    """One pass of memory version GC. Selects up to ``batch_size`` rows
+    whose ``expires_at < now()`` and aren't already redacted, tombstones
+    them (rotates ``storage_path`` to '', ``content_sha256`` to zeros,
+    sets ``redacted_at``), and unlinks their FileStore bytes when no
+    other live version dedupes to the same path.
+
+    Returns counts so the caller (cron loop / tests / on-demand) can
+    surface them via logs or events.
+    """
+    fs = LocalFileStore(root=memory_store_root())
+    limit = batch_size or memory_gc_batch_size()
+
+    rows = await fetch_all(
+        """
+        SELECT id, storage_path, size_bytes
+        FROM memory_versions
+        WHERE expires_at < NOW() AND redacted_at IS NULL
+        LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        return {"versions_redacted": 0, "bytes_freed": 0}
+
+    now = datetime.now(tz=timezone.utc)
+    versions_redacted = 0
+    bytes_freed = 0
+    for row in rows:
+        storage_path = row["storage_path"]
+        size_bytes = row["size_bytes"] or 0
+
+        # Tombstone first — if FileStore.delete fails, the row's still in
+        # a consistent post-redact state and a future pass won't re-pick
+        # it. The opposite order can leak bytes if the UPDATE racing
+        # behind the unlink fails.
+        await execute(
+            """
+            UPDATE memory_versions
+            SET redacted_at = $1, storage_path = '', content_sha256 = repeat('0', 64),
+                size_bytes = 0
+            WHERE id = $2 AND redacted_at IS NULL
+            """,
+            now,
+            row["id"],
+        )
+        versions_redacted += 1
+        bytes_freed += size_bytes
+
+        # Only unlink the content-addressed object when no other live
+        # version still points at it. Two memories that happened to hash
+        # to the same bytes share storage; tombstoning one mustn't
+        # disturb the other.
+        if storage_path:
+            other = await fetch_one(
+                """
+                SELECT 1 AS x FROM memory_versions
+                WHERE storage_path = $1 AND id != $2 AND redacted_at IS NULL
+                LIMIT 1
+                """,
+                storage_path,
+                row["id"],
+            )
+            if other is None:
+                try:
+                    await fs.delete(storage_path)
+                except FileNotFoundError:
+                    # Storage row predates the FileStore object — log
+                    # but don't fail the pass; the DB tombstone is the
+                    # source of truth.
+                    pass
+                except OSError:
+                    logger.exception(
+                        "memory GC failed to unlink %s", storage_path,
+                    )
+
+    return {"versions_redacted": versions_redacted, "bytes_freed": bytes_freed}
+
+
+async def cleanup_expired_memory_versions(
+    interval_seconds: int | None = None,
+) -> None:
+    """Background task: periodic memory version GC. Logs the per-pass
+    counts so operators can graph GC throughput without a dedicated
+    metrics export.
+    """
+    interval = interval_seconds or memory_gc_interval_seconds()
+    logger.info("Memory GC task started (interval=%ds).", interval)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            counts = await run_memory_gc()
+            if counts["versions_redacted"] > 0:
+                logger.info(
+                    "memory.gc pass: versions_redacted=%d bytes_freed=%d",
+                    counts["versions_redacted"], counts["bytes_freed"],
+                )
+        except asyncio.CancelledError:
+            logger.info("Memory GC task cancelled.")
+            raise
+        except Exception:
+            logger.exception("memory GC loop error — continuing")
 
 
 def render_memory_system_prompt_block(
