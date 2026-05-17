@@ -1184,6 +1184,28 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
         uid,
     )
 
+    # v0.6 PR2 — if this session is a thread, emit
+    # ``session.thread_terminated`` on the parent so a coordinator
+    # watching its own event stream learns the worker finished.
+    keys = updated.keys() if updated is not None else []
+    parent_session_id = (
+        updated["parent_session_id"]
+        if updated is not None and "parent_session_id" in keys
+        else None
+    )
+    if parent_session_id is not None:
+        try:
+            await append_event(
+                str(parent_session_id),
+                "session.thread_terminated",
+                {"thread_id": session_id},
+            )
+        except Exception:
+            logger.exception(
+                "failed to append session.thread_terminated event "
+                "to parent %s", parent_session_id,
+            )
+
     # Transition all live session_resources rows to 'unmounted'. Destroying
     # the container removes every bind, so the rows are no longer mounted;
     # this UPDATE makes the DELETE /v1/files 409 check (which filters on
@@ -1458,6 +1480,177 @@ async def list_outcome_evaluations(session_id: str) -> OutcomeEvaluationsRespons
     return OutcomeEvaluationsResponse(data=data)
 
 
+# ---- v0.6 PR2 — multi-agent threads ----
+
+
+class _SpawnThreadRequest(BaseModel):
+    """Body shape for ``POST /v1/sessions/{parent_id}/threads``.
+
+    Most fields shadow ``CreateSessionRequest`` so a coordinator can
+    spawn a worker with any agent + environment + resources combo —
+    the spawn is just a normal session-create with the parent link
+    overlaid.
+    """
+
+    agent_id: str
+    environment_id: str
+    title: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int | None = None
+    vault_ids: list[str] = Field(default_factory=list)
+    resources: list[Any] = Field(default_factory=list)
+    input_message: str | dict | list | None = None
+    outcome: OutcomeDefinition | None = None
+
+
+class ThreadListResponse(BaseModel):
+    data: list[SessionResponse]
+
+
+@router.post(
+    "/{parent_id}/threads",
+    status_code=201,
+    response_model=SessionResponse,
+)
+async def spawn_thread(
+    parent_id: str, body: _SpawnThreadRequest, request: Request
+) -> SessionResponse:
+    """Spawn a worker thread off ``parent_id``.
+
+    The new session is created via the same machinery as a normal
+    ``POST /v1/sessions`` (validation, container provisioning,
+    resources, …) but with two differences:
+
+    1. ``parent_session_id`` is set to ``parent_id``.
+    2. The nesting cap (``LINCHPIN_MAX_THREAD_DEPTH``, default 3) is
+       enforced — a coordinator-of-coordinator-of-coordinator chain
+       rejects rather than billing the user for runaway loops.
+
+    On success, ``session.thread_created`` lands on the parent's
+    event log so a coordinator watching its own stream learns about
+    its worker without polling.
+    """
+    from app.threads import ThreadDepthExceeded, ensure_can_spawn_thread
+
+    try:
+        parent_uid = uuid.UUID(parent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {parent_id} not found"},
+        )
+    parent_row = await fetch_one("SELECT id, archived_at FROM sessions WHERE id = $1", parent_uid)
+    if parent_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {parent_id} not found"},
+        )
+    if parent_row["archived_at"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "conflict",
+                "message": f"parent session {parent_id} is archived",
+            },
+        )
+
+    try:
+        await ensure_can_spawn_thread(parent_uid)
+    except ThreadDepthExceeded as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "thread_depth_exceeded", "message": str(exc)},
+        )
+
+    # Forward to the main ``create_session`` flow by building a
+    # CreateSessionRequest. The thread is otherwise a normal session.
+    create_payload = {
+        "agent_id": body.agent_id,
+        "environment_id": body.environment_id,
+        "title": body.title,
+        "metadata": body.metadata,
+        "ttl_seconds": body.ttl_seconds,
+        "vault_ids": body.vault_ids,
+        "resources": body.resources,
+    }
+    if body.outcome is not None:
+        create_payload["outcome"] = body.outcome.model_dump()
+    req = CreateSessionRequest.model_validate(create_payload)
+    # Reuse the response object the route would have built so the
+    # caller gets the same shape. Two side effects need to happen
+    # after the normal create lands: stamp parent_session_id, and
+    # emit the parent's session.thread_created event.
+    response = Response()
+    new_session = await create_session(req, request, response)  # type: ignore[arg-type]
+
+    # Stamp parent_session_id directly — done after create so the
+    # main path stays simple and the column is the only place we
+    # diverge from a top-level session.
+    await execute(
+        "UPDATE sessions SET parent_session_id = $1 WHERE id = $2",
+        parent_uid,
+        uuid.UUID(new_session.id),
+    )
+    # Seed the worker with an initial user message if one was given.
+    if body.input_message is not None:
+        try:
+            await append_event(
+                new_session.id,
+                "user.message",
+                {"content": body.input_message},
+            )
+        except Exception:
+            logger.exception(
+                "failed to seed thread %s with input_message", new_session.id,
+            )
+
+    # Notify the parent stream so a coordinator watching its event
+    # log learns the worker is up.
+    try:
+        await append_event(
+            parent_id,
+            "session.thread_created",
+            {
+                "thread_id": new_session.id,
+                "agent_id": body.agent_id,
+            },
+        )
+    except Exception:
+        logger.exception("failed to append session.thread_created event")
+
+    new_session = new_session.model_copy(update={"parent_session_id": parent_id})
+    return new_session
+
+
+@router.get(
+    "/{parent_id}/threads",
+    response_model=ThreadListResponse,
+)
+async def list_threads(parent_id: str) -> ThreadListResponse:
+    """Return every thread (including terminated) for a parent session."""
+    try:
+        parent_uid = uuid.UUID(parent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {parent_id} not found"},
+        )
+    parent_row = await fetch_one("SELECT id FROM sessions WHERE id = $1", parent_uid)
+    if parent_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Session {parent_id} not found"},
+        )
+    rows = await fetch_all(
+        "SELECT * FROM sessions WHERE parent_session_id = $1 "
+        "ORDER BY created_at ASC",
+        parent_uid,
+    )
+    return ThreadListResponse(
+        data=[_row_to_session(r, resources=[]) for r in rows],
+    )
+
+
 @router.post("/{session_id}/archive", response_model=SessionResponse)
 async def archive_session(session_id: str) -> SessionResponse:
     """Archive a session: set archived_at. Reject if already archived."""
@@ -1600,6 +1793,29 @@ async def post_events(session_id: str, body: PostEventsRequest) -> list[EventRes
             detail={"error": "conflict", "message": f"Session {session_id} is archived"},
         )
 
+    # v0.6 PR2 — if this session is a thread, mirror each event up to
+    # the parent (and on up the chain) so a coordinator watching its
+    # own stream sees one interleaved view. The original event still
+    # lands on the thread's log too, so per-thread reads aren't lost.
+    from app.threads import thread_event_payload
+    parent_id_for_mirror = row.get("parent_session_id") if hasattr(row, "get") else row["parent_session_id"]
+    if parent_id_for_mirror is not None:
+        parent_chain = [str(parent_id_for_mirror)]
+        # Walk up to the root so a deeply-nested thread shows in every
+        # ancestor's event log, not only its immediate parent.
+        current = parent_id_for_mirror
+        while True:
+            anc = await fetch_one(
+                "SELECT parent_session_id FROM sessions WHERE id = $1",
+                current,
+            )
+            if anc is None or anc["parent_session_id"] is None:
+                break
+            current = anc["parent_session_id"]
+            parent_chain.append(str(current))
+    else:
+        parent_chain = []
+
     # Append each event
     created_events: list[EventResponse] = []
     for ev in body.events:
@@ -1614,10 +1830,29 @@ async def post_events(session_id: str, body: PostEventsRequest) -> list[EventRes
                 processed_at=event.processed_at,
             )
         )
+        # Mirror to every ancestor so each level of the coordinator
+        # tree sees the thread's activity. The thread_id payload tag
+        # is added so listeners can filter / attribute events.
+        for ancestor in parent_chain:
+            try:
+                await append_event(
+                    ancestor,
+                    ev.type,
+                    thread_event_payload(session_id, ev.payload),
+                )
+            except Exception:
+                logger.exception(
+                    "failed to mirror %s event from thread %s to ancestor %s",
+                    ev.type, session_id, ancestor,
+                )
 
     # Trigger LISTEN/NOTIFY — replace hyphens with underscores for PG channel name validity
     channel = f"session_{session_id.replace('-', '_')}"
     await notify(channel, "new_events")
+    # And NOTIFY each ancestor channel so subscribers tailing the
+    # coordinator's stream wake up on a thread write.
+    for ancestor in parent_chain:
+        await notify(f"session_{ancestor.replace('-', '_')}", "new_events")
 
     return created_events
 
