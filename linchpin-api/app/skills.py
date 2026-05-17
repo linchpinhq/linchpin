@@ -141,6 +141,101 @@ def read_skill_md(bundle_bytes: bytes) -> str:
     )
 
 
+def session_skills_cache_dir(session_id: str, skill_name: str) -> str:
+    """Host-side cache dir where a skill bundle is unpacked for a
+    session. Bind-mounted into the container at
+    ``/mnt/skills/<skill_name>/`` read-only.
+
+    Mirrors the per-session memory cache layout so cleanup on
+    terminate is symmetric (wipe the parent ``skills/`` subtree).
+    """
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    return os.path.join(
+        tmp, "linchpin-sessions", session_id, "skills", skill_name
+    )
+
+
+def session_skills_root(session_id: str) -> str:
+    """Parent dir of all per-session skill caches."""
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    return os.path.join(tmp, "linchpin-sessions", session_id, "skills")
+
+
+def _is_unsafe_member(name: str) -> bool:
+    """Reject tar/zip entries that would escape the destination dir."""
+    if name.startswith("/") or name.startswith("\\"):
+        return True
+    parts = name.replace("\\", "/").split("/")
+    return any(part in ("..",) for part in parts)
+
+
+def materialize_skill_bundle(
+    *,
+    bundle_path: str,
+    session_id: str,
+    skill_name: str,
+) -> str:
+    """Unpack a skill bundle into the per-session host cache dir.
+
+    Skips entries that would escape the destination (absolute paths,
+    ``..`` traversal). Returns the cache directory path so the caller
+    can build a ``ResourceMount`` from it.
+
+    Bundles are tar.gz or zip — sniffed by extension since uploads
+    already normalized to .tar.gz on the storage path.
+    """
+    cache_dir = session_skills_cache_dir(session_id, skill_name)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if bundle_path.endswith(".zip"):
+        with zipfile.ZipFile(bundle_path, mode="r") as zf:
+            for member in zf.namelist():
+                if _is_unsafe_member(member):
+                    logger.warning("skipping unsafe zip member: %r", member)
+                    continue
+                zf.extract(member, cache_dir)
+    else:
+        with tarfile.open(bundle_path, mode="r:gz") as tf:
+            for member in tf:
+                if _is_unsafe_member(member.name):
+                    logger.warning("skipping unsafe tar member: %r", member.name)
+                    continue
+                # Reject device files / fifos / hardlinks for safety —
+                # the container only needs regular files + dirs.
+                if not (member.isreg() or member.isdir()):
+                    continue
+                # Python 3.12+ data filter — additional defense-in-depth
+                # against device files, hardlinks, symlinks-outside-tree.
+                tf.extract(member, cache_dir, filter="data")
+    return cache_dir
+
+
+def render_skills_system_prompt_block(
+    skills: list[dict[str, object]],
+) -> str:
+    """Render the auto-injected ``<linchpin:skills>`` system prompt block.
+
+    Each entry has ``name`` and ``description``. Level-1 progressive
+    disclosure — agents read the full SKILL.md from
+    ``/mnt/skills/<name>/SKILL.md`` only when triggered.
+    """
+    if not skills:
+        return ""
+    lines = ["<linchpin:skills>"]
+    lines.append("The following skills are available in this session:")
+    lines.append("")
+    for s in skills:
+        name = s.get("name", "")
+        description = s.get("description", "")
+        lines.append(f"- {name}: {description}")
+        lines.append(
+            f"  Read /mnt/skills/{name}/SKILL.md for usage details "
+            "and run any scripts under that directory as needed."
+        )
+    lines.append("</linchpin:skills>")
+    return "\n".join(lines)
+
+
 def parse_skill_metadata(bundle_bytes: bytes) -> tuple[str, str]:
     """Extract + validate ``(name, description)`` from a skill bundle.
 

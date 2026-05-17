@@ -222,6 +222,9 @@ class MCPServerConfig(BaseModel):
 # Agent
 # ---------------------------------------------------------------------------
 
+MAX_SKILLS_PER_AGENT = 8  # v0.4.0 — mirrors Anthropic's max-8 cap.
+
+
 class Agent(BaseModel):
     """Agent domain model."""
 
@@ -232,6 +235,7 @@ class Agent(BaseModel):
     system: str
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)         # v0.4.0
     created_at: datetime
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
@@ -256,6 +260,7 @@ class AgentVersion(BaseModel):
     system: str
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)         # v0.4.0
     snapshotted_at: datetime
 
 
@@ -535,6 +540,7 @@ class CreateAgentRequest(BaseModel):
     system: str
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)         # v0.4.0
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5
 
@@ -546,6 +552,18 @@ class CreateAgentRequest(BaseModel):
         # validation runs.
         return unwrap_toolset_bundle(v)
 
+    @field_validator("skills")
+    @classmethod
+    def _enforce_skills_cap(cls, v: list[str]) -> list[str]:
+        if len(v) > MAX_SKILLS_PER_AGENT:
+            raise ValueError(
+                f"agent.skills exceeds {MAX_SKILLS_PER_AGENT}-per-agent cap "
+                f"(got {len(v)})"
+            )
+        if len(set(v)) != len(v):
+            raise ValueError("agent.skills contains duplicate skill ids")
+        return v
+
 
 class UpdateAgentRequest(BaseModel):
     """PATCH /v1/agents/{id} request body — all fields optional."""
@@ -555,6 +573,7 @@ class UpdateAgentRequest(BaseModel):
     system: str | None = None
     tools: list[ToolConfig] | None = None
     mcp_servers: list[MCPServerConfig] | None = None
+    skills: list[str] | None = None                         # v0.4.0
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] | None = None                  # v0.2.0 item #5
 
@@ -565,6 +584,20 @@ class UpdateAgentRequest(BaseModel):
         if v is None:
             return None
         return unwrap_toolset_bundle(v)
+
+    @field_validator("skills")
+    @classmethod
+    def _enforce_skills_cap(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        if len(v) > MAX_SKILLS_PER_AGENT:
+            raise ValueError(
+                f"agent.skills exceeds {MAX_SKILLS_PER_AGENT}-per-agent cap "
+                f"(got {len(v)})"
+            )
+        if len(set(v)) != len(v):
+            raise ValueError("agent.skills contains duplicate skill ids")
+        return v
 
 
 class CreateEnvironmentRequest(BaseModel):
@@ -631,6 +664,7 @@ class AgentResponse(BaseModel):
     system: str
     tools: list[ToolConfig] = Field(default_factory=list)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)         # v0.4.0
     created_at: datetime
     description: str | None = None                          # v0.2.0 item #5
     metadata: dict[str, Any] = Field(default_factory=dict)  # v0.2.0 item #5

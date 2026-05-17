@@ -34,6 +34,10 @@ def _row_to_agent(row) -> AgentResponse:
     keys = row.keys()
     metadata_raw = row["metadata"] if "metadata" in keys else {}
     metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+    # v0.4.0 — skills column is JSONB; default '[]' so pre-0012 rows
+    # don't crash. Stored as a list of skill-id strings.
+    skills_raw = row["skills"] if "skills" in keys else []
+    skills = json.loads(skills_raw) if isinstance(skills_raw, str) else (skills_raw or [])
     return AgentResponse(
         id=str(row["id"]),
         name=row["name"],
@@ -42,6 +46,7 @@ def _row_to_agent(row) -> AgentResponse:
         system=row["system"],
         tools=json.loads(row["tools"]) if isinstance(row["tools"], str) else row["tools"],
         mcp_servers=json.loads(row["mcp_servers"]) if isinstance(row["mcp_servers"], str) else row["mcp_servers"],
+        skills=skills,
         created_at=row["created_at"],
         description=row["description"] if "description" in keys else None,
         metadata=metadata or {},
@@ -52,6 +57,9 @@ def _row_to_agent(row) -> AgentResponse:
 def _row_to_agent_version(row) -> AgentVersion:
     metadata_raw = row["metadata"]
     metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+    keys = row.keys()
+    skills_raw = row["skills"] if "skills" in keys else []
+    skills = json.loads(skills_raw) if isinstance(skills_raw, str) else (skills_raw or [])
     return AgentVersion(
         agent_id=str(row["agent_id"]),
         version=row["version"],
@@ -62,6 +70,7 @@ def _row_to_agent_version(row) -> AgentVersion:
         system=row["system"],
         tools=json.loads(row["tools"]) if isinstance(row["tools"], str) else row["tools"],
         mcp_servers=json.loads(row["mcp_servers"]) if isinstance(row["mcp_servers"], str) else row["mcp_servers"],
+        skills=skills,
         snapshotted_at=row["snapshotted_at"],
     )
 
@@ -85,10 +94,15 @@ async def create_agent(body: CreateAgentRequest) -> AgentResponse:
     tools_json = [t.model_dump(mode="json") for t in body.tools]
     mcp_json = [m.model_dump(mode="json") for m in body.mcp_servers]
 
+    # v0.4.0 — validate every skill id exists + isn't archived. The
+    # max-8 cap is enforced by the Pydantic validator on the model.
+    await _validate_skill_ids(body.skills)
+
     row = await fetch_one(
         """
-        INSERT INTO agents (id, name, model, system, tools, mcp_servers, description, metadata)
-        VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb)
+        INSERT INTO agents
+            (id, name, model, system, tools, mcp_servers, skills, description, metadata)
+        VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9::jsonb)
         RETURNING *
         """,
         uuid.UUID(agent_id),
@@ -97,11 +111,52 @@ async def create_agent(body: CreateAgentRequest) -> AgentResponse:
         body.system,
         json.dumps(tools_json),
         json.dumps(mcp_json),
+        json.dumps(body.skills),
         body.description,
         json.dumps(body.metadata),
     )
 
     return _row_to_agent(row)
+
+
+async def _validate_skill_ids(skill_ids: list[str]) -> None:
+    """Reject create/update if any skill id is missing or archived.
+
+    Mirrors the vault_ids existence check in sessions.py — fail fast
+    with a 422 so the caller doesn't end up with an agent pointing at
+    deleted bundles.
+    """
+    for sid in skill_ids:
+        try:
+            uid = uuid.UUID(sid)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"Invalid skill id: {sid}",
+                },
+            )
+        row = await fetch_one(
+            "SELECT id, archived_at FROM skills WHERE id = $1",
+            uid,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"Skill {sid} not found",
+                },
+            )
+        if row["archived_at"] is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "validation_error",
+                    "message": f"Skill {sid} is archived",
+                },
+            )
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -159,11 +214,17 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest) -> AgentResponse
         current["mcp_servers"] if isinstance(current["mcp_servers"], str)
         else json.dumps(current["mcp_servers"])
     )
+    skills_current = current["skills"] if "skills" in current.keys() else []
+    skills_str = (
+        skills_current if isinstance(skills_current, str)
+        else json.dumps(skills_current or [])
+    )
     await execute(
         """
         INSERT INTO agent_versions
-            (agent_id, version, name, description, metadata, model, system, tools, mcp_servers)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9::jsonb)
+            (agent_id, version, name, description, metadata, model, system,
+             tools, mcp_servers, skills)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9::jsonb, $10::jsonb)
         ON CONFLICT (agent_id, version) DO NOTHING
         """,
         uid,
@@ -175,6 +236,7 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest) -> AgentResponse
         current["system"],
         tools_str,
         mcp_str,
+        skills_str,
     )
 
     # Build dynamic SET clause from non-None fields.
@@ -206,6 +268,12 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest) -> AgentResponse
         idx += 1
         set_parts.append(f"mcp_servers = ${idx}::jsonb")
         params.append(json.dumps([m.model_dump(mode="json") for m in body.mcp_servers]))
+
+    if body.skills is not None:
+        await _validate_skill_ids(body.skills)
+        idx += 1
+        set_parts.append(f"skills = ${idx}::jsonb")
+        params.append(json.dumps(body.skills))
 
     # v0.2.0 item #5 — description + metadata
     if body.description is not None:
