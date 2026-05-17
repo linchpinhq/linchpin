@@ -962,3 +962,121 @@ def test_get_session_includes_vault_ids(sandbox_client):
 
     assert resp.status_code == 200
     assert resp.json()["vault_ids"] == [vault_id]
+
+
+# ---- v0.3 PR6 — vault_ids → resources[] fold-in ----
+
+
+@patch("app.routes.sessions.append_event", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_legacy_vault_ids_sets_deprecation_header(
+    mock_fetch, mock_fetch_all, mock_append_event, sandbox_client
+):
+    """Sending the legacy ``vault_ids`` field marks the response with
+    ``Linchpin-Deprecation: vault_ids`` and emits a
+    ``session.deprecation_used`` event."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    vault_id = str(uuid.uuid4())
+
+    mock_fetch.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        {"id": uuid.UUID(vault_id), "archived_at": None},
+        _make_session_row(agent_id=agent_id, environment_id=env_id, vault_ids=[vault_id]),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {"agent_id": agent_id, "environment_id": env_id, "vault_ids": [vault_id]}
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.headers.get("Linchpin-Deprecation") == "vault_ids"
+    deprecation_events = [
+        c for c in mock_append_event.await_args_list
+        if c.args[1] == "session.deprecation_used"
+    ]
+    assert len(deprecation_events) == 1
+    assert deprecation_events[0].args[2]["shape"] == "vault_ids"
+
+
+@patch("app.routes.sessions.append_event", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_vault_resource_no_deprecation(
+    mock_fetch, mock_fetch_all, mock_append_event, sandbox_client
+):
+    """Sending vault via the new ``resources[{type: vault, ...}]`` shape
+    does NOT set the deprecation header — only the legacy ``vault_ids``
+    field triggers it."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    vault_id = str(uuid.uuid4())
+
+    mock_fetch.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        {"id": uuid.UUID(vault_id), "archived_at": None},
+        _make_session_row(agent_id=agent_id, environment_id=env_id, vault_ids=[vault_id]),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [{"type": "vault", "vault_id": vault_id}],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.headers.get("Linchpin-Deprecation") is None
+    assert resp.json()["vault_ids"] == [vault_id]
+    deprecation_events = [
+        c for c in mock_append_event.await_args_list
+        if c.args[1] == "session.deprecation_used"
+    ]
+    assert deprecation_events == []
+
+
+@patch("app.routes.sessions.append_event", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_create_session_both_shapes_dedupe_to_one_vault(
+    mock_fetch, mock_fetch_all, mock_append_event, sandbox_client
+):
+    """Sending the same vault id in both ``vault_ids`` and
+    ``resources[]`` dedupes to a single vault entry. Legacy field still
+    triggers the deprecation signal."""
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    vault_id = str(uuid.uuid4())
+
+    mock_fetch.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        {"id": uuid.UUID(vault_id), "archived_at": None},
+        _make_session_row(agent_id=agent_id, environment_id=env_id, vault_ids=[vault_id]),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "vault_ids": [vault_id],
+        "resources": [{"type": "vault", "vault_id": vault_id}],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    # Header set because legacy field was present.
+    assert resp.headers.get("Linchpin-Deprecation") == "vault_ids"
+    # Exactly one vault lookup happened (3rd fetch_one in side_effect).
+    vault_lookups = [
+        c for c in mock_fetch.await_args_list
+        if "FROM vaults" in c.args[0]
+    ]
+    assert len(vault_lookups) == 1

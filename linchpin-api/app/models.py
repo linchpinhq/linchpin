@@ -861,7 +861,7 @@ class PaginatedFilesResponse(BaseModel):
 # Session Resources (v0.2.0 — Resources framework, item #1)
 # ---------------------------------------------------------------------------
 
-SessionResourceType = Literal["file", "memory_store", "github_repository"]
+SessionResourceType = Literal["file", "memory_store", "github_repository", "vault"]
 SessionResourceState = Literal["mounted", "unmounting", "unmounted", "failed"]
 
 # Mount paths reserved by the platform — callers cannot mount resources here.
@@ -953,10 +953,29 @@ class GithubRepositoryResource(BaseModel):
         return _validate_mount_path(value)
 
 
+class VaultResource(BaseModel):
+    """Attach a credential vault to the session.
+
+    Folded-in from the legacy ``vault_ids`` field — sending vault_ids on
+    the request continues to parse for one more minor but emits a
+    ``Linchpin-Deprecation: vault_ids`` header + a
+    ``session.deprecation_used`` event. Internal code normalizes both
+    inputs into ``resources[]`` of ``type='vault'`` so the rest of the
+    pipeline sees a single homogeneous list.
+
+    No ``mount_path`` — vaults inject credentials into the agent
+    runtime through ``credentials.py``, not via a sandbox bind mount.
+    """
+
+    type: Literal["vault"]
+    vault_id: str
+
+
 SessionResourceConfig = Annotated[
     Annotated[FileResource, Tag("file")]
     | Annotated[MemoryStoreResource, Tag("memory_store")]
-    | Annotated[GithubRepositoryResource, Tag("github_repository")],
+    | Annotated[GithubRepositoryResource, Tag("github_repository")]
+    | Annotated[VaultResource, Tag("vault")],
     Discriminator("type"),
 ]
 

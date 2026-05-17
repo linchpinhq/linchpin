@@ -34,6 +34,7 @@ from app.models import (
     MemoryStoreResource,
     RESERVED_MOUNT_PREFIXES,
     SessionResourceConfig,
+    VaultResource,
 )
 
 
@@ -199,6 +200,14 @@ class TestDiscriminator:
         })
         assert isinstance(parsed, MemoryStoreResource)
         assert parsed.access == "read_only"  # default
+
+    def test_parses_vault_resource(self):
+        parsed = _ADAPTER.validate_python({
+            "type": "vault",
+            "vault_id": "v_123",
+        })
+        assert isinstance(parsed, VaultResource)
+        assert parsed.vault_id == "v_123"
 
     def test_parses_github_repository_resource(self):
         parsed = _ADAPTER.validate_python({
