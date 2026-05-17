@@ -27,7 +27,12 @@ from sse_starlette.sse import EventSourceResponse
 from app.db import fetch_all, fetch_one, execute, listen, notify
 from app.events import append_event, decode_cursor, get_events, release_session_event_lock
 from app.files import get_file_store
-from app.memory import materialize_memory_store, max_stores_per_session
+from app.memory import (
+    materialize_memory_store,
+    max_stores_per_session,
+    session_memory_cache_dir,
+)
+from app.memory_watcher import watch_memory_store
 from app.orchestrator import run_session
 from app.sandbox import DEFAULT_BASE_IMAGE, ResourceMount, SandboxError
 from app.streaming import get_stream
@@ -448,13 +453,13 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         mode="rw",
     ))
 
-    # v0.3 PR3 — materialize each attached memory_store into its per-session
-    # host cache dir before container create. PR4 will turn these dirs into
-    # bind mounts at /mnt/memory/<name>/; PR3 just hydrates the read-side and
-    # records the resource so the orchestrator's <linchpin:memory> system-
-    # prompt block can describe them to the agent. We materialize before
-    # container create so a hydration failure (disk full, bad storage row)
-    # 500s cleanly with no orphan container or DB state to roll back.
+    # v0.3 PR3 + PR4 — materialize each attached memory_store into its
+    # per-session host cache dir and add a bind mount so the container
+    # sees it at /mnt/memory/<name>/. PR4 also spawns a watcher per
+    # rw store after the session row exists (below). We materialize +
+    # mount before container create so any hydration failure (disk full,
+    # bad storage row) 500s cleanly with no orphan container or DB state
+    # to roll back.
     for idx, resource in enumerate(body.resources):
         if not isinstance(resource, MemoryStoreResource):
             continue
@@ -465,7 +470,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                 "validation/materialize loops are out of step"
             )
         try:
-            await materialize_memory_store(
+            cache_dir = await materialize_memory_store(
                 session_id=session_id,
                 memory_store_id=meta["store_uid"],
                 store_name=meta["name"],
@@ -485,6 +490,15 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                     ),
                 },
             ) from exc
+        # Bind mount mode mirrors the resource's access field. Read-only
+        # stores get a kernel-enforced ro bind, so the agent can't write
+        # at all and PR4's watcher doesn't run for them. Read-write stores
+        # get rw + a writeback watcher (spawned after session row insert).
+        mounts.append(ResourceMount(
+            host_path=cache_dir,
+            container_path=f"/mnt/memory/{meta['name']}",
+            mode="rw" if resource.access == "read_write" else "ro",
+        ))
 
     # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
@@ -714,6 +728,45 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
         request.app.state.watcher_tasks = watcher_tasks
     watcher_tasks[session_id] = watcher_task
 
+    # v0.3 PR4 — spawn one memory writeback watcher per attached read_write
+    # memory_store resource. Read-only stores get no watcher (the kernel
+    # rejects writes at the bind mount). Each task is keyed by session id
+    # so terminate_session can cancel them as a group.
+    memory_watcher_tasks_by_session = getattr(request.app.state, "memory_watcher_tasks", None)
+    if memory_watcher_tasks_by_session is None:
+        memory_watcher_tasks_by_session = {}
+        request.app.state.memory_watcher_tasks = memory_watcher_tasks_by_session
+    spawned: list[asyncio.Task] = []
+    for idx, resource in enumerate(body.resources):
+        if not isinstance(resource, MemoryStoreResource):
+            continue
+        if resource.access != "read_write":
+            continue
+        meta = memory_meta[idx]
+        if meta is None:
+            continue
+        mw_task = asyncio.create_task(
+            watch_memory_store(
+                session_id,
+                meta["store_uid"],
+                meta["name"],
+            )
+        )
+
+        def _mw_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc:
+                logger.error(
+                    "Memory watcher task for session %s failed: %s", session_id, exc,
+                )
+
+        mw_task.add_done_callback(_mw_done)
+        spawned.append(mw_task)
+    if spawned:
+        memory_watcher_tasks_by_session[session_id] = spawned
+
     return _row_to_session(row, resources=resources)
 
 
@@ -895,6 +948,21 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
         except (asyncio.CancelledError, Exception):
             pass
 
+    # v0.3 PR4 — cancel every memory writeback watcher attached to this
+    # session. Boot scan reconciles any drift on the next session resume
+    # (there isn't one for terminated sessions, but the symmetry with the
+    # deliverables watcher's restart story keeps the model coherent).
+    memory_watcher_tasks = getattr(request.app.state, "memory_watcher_tasks", {})
+    mw_tasks = memory_watcher_tasks.pop(session_id, [])
+    for mw_task in mw_tasks:
+        if not mw_task.done():
+            mw_task.cancel()
+    for mw_task in mw_tasks:
+        try:
+            await mw_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     # PR5 — terminal cleanup of the session's writable bind directory.
     # During the session this directory is the agent's workspace (the
     # source files are deliberately retained even after the watcher mirrors
@@ -904,6 +972,15 @@ async def terminate_session(session_id: str, request: Request) -> SessionRespons
     await asyncio.to_thread(
         shutil.rmtree, str(session_outputs_dir(session_id)), True,
     )
+
+    # v0.3 PR4 — wipe the per-session memory cache dir. The canonical
+    # state is in DB + FileStore (cache is regenerable). Path mirrors
+    # the session_memory_cache_dir() layout: parent of any single store
+    # dir is the per-session memory root.
+    memory_cache_root = os.path.dirname(
+        session_memory_cache_dir(session_id, "_placeholder")
+    )
+    await asyncio.to_thread(shutil.rmtree, memory_cache_root, True)
 
     # Drop the per-session events.append lock so the dict doesn't grow
     # unboundedly across the api process's lifetime.

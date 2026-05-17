@@ -158,6 +158,7 @@ def sandbox_client(tmp_path):
         patch("app.routes.sessions.append_event", new_callable=AsyncMock),
         patch("app.routes.sessions.ensure_session_outputs_dir", side_effect=_fake_ensure),
         patch("app.routes.sessions.watch_session_deliverables", new_callable=AsyncMock),
+        patch("app.routes.sessions.watch_memory_store", new_callable=AsyncMock),
     ):
         mock_sandbox = MagicMock()
         mock_sandbox.create = AsyncMock(return_value="container-abc")
@@ -692,6 +693,194 @@ def test_memory_store_cap_exceeded_returns_422(
     assert resp.status_code == 422
     assert "cap is 2" in resp.json()["detail"]["message"]
     mock_materialize.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# v0.3 PR4 — memory_store bind mount + per-store watcher
+# ---------------------------------------------------------------------------
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_read_only_mounts_ro_no_watcher(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    """read_only memory_store → bind mount has mode='ro' and no watcher
+    is spawned (kernel enforces ro at the bind, no writeback needed)."""
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    mock_materialize.return_value = "/tmp/cache/preferences"
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id, name="preferences"),
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=session_id,
+            mount_path="/mnt/memory/preferences",
+            config={"memory_store_id": store_id, "access": "read_only"},
+        ) | {"type": "memory_store"},
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id, "access": "read_only"},
+        ],
+    }
+    with patch(
+        "app.routes.sessions.watch_memory_store", new_callable=AsyncMock
+    ) as mock_watch:
+        resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    mounts = mock_sandbox.create.call_args.kwargs["mounts"]
+    mem_mounts = [m for m in mounts if m.container_path == "/mnt/memory/preferences"]
+    assert len(mem_mounts) == 1
+    assert mem_mounts[0].mode == "ro"
+    assert mem_mounts[0].host_path == "/tmp/cache/preferences"
+    mock_watch.assert_not_called()
+
+
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_memory_store_read_write_mounts_rw_and_spawns_watcher(
+    mock_fetch_one, mock_fetch_all, mock_materialize, sandbox_client
+):
+    """read_write memory_store → bind mount has mode='rw' and a
+    watcher task is spawned via watch_memory_store(session, store, name)."""
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    mock_materialize.return_value = "/tmp/cache/notes"
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id, name="notes"),
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=session_id,
+            mount_path="/mnt/memory/notes",
+            config={"memory_store_id": store_id, "access": "read_write"},
+        ) | {"type": "memory_store"},
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id, "access": "read_write"},
+        ],
+    }
+    with patch(
+        "app.routes.sessions.watch_memory_store", new_callable=AsyncMock
+    ) as mock_watch:
+        resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    mounts = mock_sandbox.create.call_args.kwargs["mounts"]
+    mem_mounts = [m for m in mounts if m.container_path == "/mnt/memory/notes"]
+    assert len(mem_mounts) == 1
+    assert mem_mounts[0].mode == "rw"
+    assert mem_mounts[0].host_path == "/tmp/cache/notes"
+    mock_watch.assert_called_once()
+    call_args = mock_watch.call_args
+    # session_id is generated by sessions.py via uuid.uuid4(); just confirm
+    # it's a string. The store uid + name are derived from the mock rows so
+    # those we can pin precisely.
+    assert isinstance(call_args.args[0], str)
+    assert str(call_args.args[1]) == store_id
+    assert call_args.args[2] == "notes"
+
+
+@patch("app.routes.sessions.execute", new_callable=AsyncMock)
+@patch("app.routes.sessions.materialize_memory_store", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_terminate_session_cancels_memory_watchers(
+    mock_fetch_one, mock_fetch_all, mock_materialize, mock_execute, sandbox_client
+):
+    """terminate_session cancels every memory watcher task it spawned at
+    session create — symmetric with the deliverables watcher cleanup."""
+    import asyncio
+
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    store_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    mock_materialize.return_value = "/tmp/cache/notes"
+
+    # We swap watch_memory_store for a never-completing coroutine so the
+    # spawned task is observable + cancellable.
+    async def _forever(*a, **kw):
+        await asyncio.sleep(3600)
+
+    mock_fetch_one.side_effect = [
+        # create_session
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_memory_store_row(store_id=store_id, name="notes"),
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=session_id,
+            mount_path="/mnt/memory/notes",
+            config={"memory_store_id": store_id, "access": "read_write"},
+        ) | {"type": "memory_store"},
+        # terminate_session
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+        _make_session_row(session_id=session_id, agent_id=agent_id, environment_id=env_id),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {"type": "memory_store", "memory_store_id": store_id, "access": "read_write"},
+        ],
+    }
+    # Test isolation — clear any leftover watcher registry from earlier
+    # tests that ran with the fixture's no-op watcher patch.
+    from app.main import app
+    if hasattr(app.state, "memory_watcher_tasks"):
+        app.state.memory_watcher_tasks.clear()
+
+    with patch(
+        "app.routes.sessions.watch_memory_store",
+        new_callable=AsyncMock,
+        side_effect=_forever,
+    ):
+        resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+        assert resp.status_code == 201, resp.text
+
+        # The internal session_id is generated by sessions.py via uuid.uuid4()
+        # and is decoupled from the id we mocked in the session row. Grab it
+        # from the watcher registry — the test rests on terminate using the
+        # same key that create stored.
+        internal_sid = next(iter(app.state.memory_watcher_tasks))
+        mw_tasks = app.state.memory_watcher_tasks[internal_sid]
+        assert len(mw_tasks) == 1
+        assert not mw_tasks[0].done()
+
+        # Terminate, then verify the watcher is cancelled + the session
+        # key is gone from the registry.
+        resp = client.delete(f"/v1/sessions/{internal_sid}", headers=AUTH)
+        assert resp.status_code == 200, resp.text
+        assert internal_sid not in app.state.memory_watcher_tasks
+        assert mw_tasks[0].cancelled() or mw_tasks[0].done()
 
 
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
