@@ -32,6 +32,7 @@ from app.memory import (
     max_stores_per_session,
     session_memory_cache_dir,
 )
+from app.git_repo import GitCloneError, clone_or_update
 from app.memory_watcher import watch_memory_store
 from app.orchestrator import run_session
 from app.sandbox import DEFAULT_BASE_IMAGE, ResourceMount, SandboxError
@@ -50,6 +51,8 @@ from app.models import (
     SessionResponse,
     SessionStats,
     SessionUsage,
+    GitRepositoryResource,
+    GithubRepositoryResource,
     VaultResource,
 )
 
@@ -359,14 +362,21 @@ async def create_session(
             # aligned with body.resources by index.
             file_meta.append(None)
             memory_meta.append(None)
+        elif isinstance(resource, (GitRepositoryResource, GithubRepositoryResource)):
+            # v0.5 PR3 — actual clone happens after the env config is
+            # loaded (so we have env_id for the cache key). Just keep
+            # the parallel meta lists aligned for now; the real work
+            # runs in the dedicated git_repository loop below.
+            file_meta.append(None)
+            memory_meta.append(None)
         else:
             raise HTTPException(
                 status_code=501,
                 detail={
                     "error": "not_implemented",
                     "message": (
-                        f"resource type '{resource.type}' is not supported in v0.3; "
-                        "only 'file' and 'memory_store' are dispatchable in this release"
+                        f"resource type '{resource.type}' is not supported in v0.5; "
+                        "see docs for the currently-dispatchable resource types"
                     ),
                 },
             )
@@ -601,6 +611,41 @@ async def create_session(
                 "description": skill_row["description"],
             })
 
+    # v0.5 PR3 — clone each attached git_repository resource into the
+    # per-environment cache and bind-mount it read-only at the
+    # requested mount_path. Failures 500 cleanly: a partial clone is
+    # not useful to the agent. Cache hits skip the network.
+    for resource in body.resources:
+        if not isinstance(
+            resource, (GitRepositoryResource, GithubRepositoryResource)
+        ):
+            continue
+        try:
+            cache_dir = await clone_or_update(
+                env_id=str(env_uid),
+                url=resource.url,
+                branch=resource.branch,
+                shallow=resource.shallow,
+                token=resource.authorization_token,
+            )
+        except GitCloneError as exc:
+            logger.error(
+                "git clone failed (session=%s, url=%s): %s",
+                session_id, resource.url, exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "git_clone_failed",
+                    "message": str(exc),
+                },
+            ) from exc
+        mounts.append(ResourceMount(
+            host_path=cache_dir,
+            container_path=resource.mount_path,
+            mode="ro",
+        ))
+
     # Provision Docker container via sandbox with the mount list.
     sandbox = request.app.state.sandbox
 
@@ -732,6 +777,27 @@ async def create_session(
                 # row; the canonical surface is still sessions.vault_ids.
                 # The fold-in is purely an input-shape convenience.
                 continue
+            elif isinstance(
+                resource, (GitRepositoryResource, GithubRepositoryResource)
+            ):
+                # v0.5 PR3 — git repos clone into the env-scoped cache
+                # above; here we just persist the mount + a redacted
+                # config so the token isn't stored alongside the row.
+                state, error = "mounted", None
+                # Canonicalize to ``git_repository`` even when the caller
+                # sent the legacy ``github_repository`` alias — downstream
+                # rows + reads see one homogeneous type.
+                resource_type = "git_repository"
+                resource_mount_path = resource.mount_path
+                config_json = json.dumps({
+                    "url": resource.url,
+                    "branch": resource.branch,
+                    "shallow": resource.shallow,
+                    # Deliberately do NOT persist authorization_token —
+                    # it lives in the env's vault rotation, not in
+                    # session_resources rows that surface via list/get.
+                    "has_token": resource.authorization_token is not None,
+                })
             else:
                 raise RuntimeError(
                     f"unexpected resource type {type(resource).__name__} reached persist loop"

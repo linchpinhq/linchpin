@@ -892,18 +892,98 @@ def test_terminate_session_cancels_memory_watchers(
         assert mw_tasks[0].cancelled() or mw_tasks[0].done()
 
 
+@patch("app.routes.sessions.clone_or_update", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
 @patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
-def test_github_repository_resource_returns_not_implemented(
-    mock_fetch_one, mock_fetch_all, sandbox_client
+def test_git_repository_resource_clones_and_mounts(
+    mock_fetch_one, mock_fetch_all, mock_clone, sandbox_client
 ):
-    client, _ = sandbox_client
+    """v0.5 — ``git_repository`` is now dispatched: clone_or_update is
+    called with the right kwargs, a ro bind mount is added at the
+    requested mount_path, and the persisted row redacts the token."""
+    client, mock_sandbox = sandbox_client
     agent_id = str(uuid.uuid4())
     env_id = str(uuid.uuid4())
+    sid = str(uuid.uuid4())
+    mock_clone.return_value = "/tmp/git-cache/some/cache/dir"
 
     mock_fetch_one.side_effect = [
         _make_agent_row(agent_id=agent_id),
         _make_env_row(env_id=env_id),
+        _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=sid,
+            mount_path="/mnt/repo",
+            config={
+                "url": "https://github.com/x/y",
+                "branch": "main",
+                "shallow": True,
+                "has_token": True,
+            },
+        ) | {"type": "git_repository"},
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {
+                "type": "git_repository",
+                "url": "https://github.com/x/y",
+                "mount_path": "/mnt/repo",
+                "branch": "main",
+                "shallow": True,
+                "authorization_token": "ghp_secret",
+            },
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+
+    assert resp.status_code == 201, resp.text
+    mock_clone.assert_awaited_once()
+    kwargs = mock_clone.await_args.kwargs
+    assert kwargs["url"] == "https://github.com/x/y"
+    assert kwargs["branch"] == "main"
+    assert kwargs["shallow"] is True
+    assert kwargs["token"] == "ghp_secret"
+    # Bind mount lands at the requested mount_path, read-only, with
+    # the host_path = clone_or_update's return value.
+    mounts = mock_sandbox.create.call_args.kwargs["mounts"]
+    repo_mounts = [m for m in mounts if m.container_path == "/mnt/repo"]
+    assert repo_mounts and repo_mounts[0].mode == "ro"
+    assert repo_mounts[0].host_path == "/tmp/git-cache/some/cache/dir"
+    # Persisted config does NOT leak the token — only a ``has_token``
+    # boolean ride-along.
+    persisted = resp.json()["resources"][0]
+    assert persisted["type"] == "git_repository"
+    assert persisted["config"]["has_token"] is True
+    assert "authorization_token" not in persisted["config"]
+
+
+@patch("app.routes.sessions.clone_or_update", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_github_repository_alias_still_accepted(
+    mock_fetch_one, mock_fetch_all, mock_clone, sandbox_client
+):
+    """v0.5 — legacy ``github_repository`` keeps parsing and dispatches
+    through the same clone path so existing v0.2-v0.4 client code
+    doesn't break on upgrade."""
+    client, mock_sandbox = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    sid = str(uuid.uuid4())
+    mock_clone.return_value = "/tmp/cache"
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+        _make_session_row(session_id=sid, agent_id=agent_id, environment_id=env_id),
+        _make_resource_row(
+            session_id=sid, mount_path="/mnt/repo",
+            config={"url": "https://github.com/x/y", "branch": None, "shallow": True, "has_token": False},
+        ) | {"type": "git_repository"},
     ]
     mock_fetch_all.return_value = []
 
@@ -919,8 +999,47 @@ def test_github_repository_resource_returns_not_implemented(
         ],
     }
     resp = client.post("/v1/sessions", json=payload, headers=AUTH)
-    assert resp.status_code == 501
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 201, resp.text
+    # Persisted row canonicalizes the type to ``git_repository``.
+    assert resp.json()["resources"][0]["type"] == "git_repository"
+    mock_clone.assert_awaited_once()
+
+
+@patch("app.routes.sessions.clone_or_update", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_all", new_callable=AsyncMock)
+@patch("app.routes.sessions.fetch_one", new_callable=AsyncMock)
+def test_git_repository_clone_failure_returns_500(
+    mock_fetch_one, mock_fetch_all, mock_clone, sandbox_client
+):
+    """A failed clone (auth, host unreachable, …) surfaces as a 500
+    with the ``git_clone_failed`` error code so callers can react."""
+    from app.git_repo import GitCloneError
+
+    client, _ = sandbox_client
+    agent_id = str(uuid.uuid4())
+    env_id = str(uuid.uuid4())
+    mock_clone.side_effect = GitCloneError("authentication failed")
+
+    mock_fetch_one.side_effect = [
+        _make_agent_row(agent_id=agent_id),
+        _make_env_row(env_id=env_id),
+    ]
+    mock_fetch_all.return_value = []
+
+    payload = {
+        "agent_id": agent_id,
+        "environment_id": env_id,
+        "resources": [
+            {
+                "type": "git_repository",
+                "url": "https://github.com/x/y",
+                "mount_path": "/mnt/repo",
+            },
+        ],
+    }
+    resp = client.post("/v1/sessions", json=payload, headers=AUTH)
+    assert resp.status_code == 500
+    assert resp.json()["detail"]["error"] == "git_clone_failed"
 
 
 # ---------------------------------------------------------------------------
