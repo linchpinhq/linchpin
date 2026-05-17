@@ -1249,3 +1249,68 @@ class MemoryVersion(BaseModel):
 
 class RedactRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1024)
+
+
+# ---------------------------------------------------------------------------
+# Skills (v0.4.0)
+# ---------------------------------------------------------------------------
+
+# Slug rules mirror memory_stores: lowercase + digits + hyphen, no
+# leading/trailing hyphen, no double hyphens, reserved namespaces stripped.
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_SKILL_NAME_RESERVED = frozenset({"anthropic", "claude", "linchpin"})
+
+SKILL_NAME_MAX_LEN = 64
+SKILL_DESCRIPTION_MAX_LEN = 1024
+SKILL_BUNDLE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB cap per skill bundle
+
+
+def validate_skill_name(value: str) -> str:
+    """Reject malformed skill names. Returns the canonical form."""
+    if not value:
+        raise ValueError("skill name must not be empty")
+    if len(value) > SKILL_NAME_MAX_LEN:
+        raise ValueError(
+            f"skill name must be ≤ {SKILL_NAME_MAX_LEN} characters (got {len(value)})"
+        )
+    if not _SKILL_NAME_RE.match(value):
+        raise ValueError(
+            "skill name must match [a-z0-9](?:[a-z0-9-]*[a-z0-9])? — "
+            "lowercase letters, digits, and hyphens only; "
+            "no leading/trailing hyphen"
+        )
+    if "--" in value:
+        raise ValueError("skill name must not contain consecutive hyphens")
+    for reserved in _SKILL_NAME_RESERVED:
+        if reserved in value:
+            raise ValueError(
+                f"skill name must not contain reserved word '{reserved}'"
+            )
+    return value
+
+
+class Skill(BaseModel):
+    """A skill bundle exposed via the API.
+
+    The bundle bytes themselves (SKILL.md + scripts/resources) live on
+    disk under ``LINCHPIN_SKILLS_ROOT`` — the row records only the
+    SKILL.md frontmatter (``name``, ``description``) plus the bundle's
+    content-addressable storage info.
+    """
+
+    id: str
+    name: str
+    description: str
+    bundle_sha256: str
+    bundle_size: int
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+
+
+class SkillListResponse(BaseModel):
+    """Paginated list payload for ``GET /v1/skills``."""
+
+    data: list[Skill]
+    has_more: bool
+    next_cursor: str | None = None

@@ -23,6 +23,7 @@ from app.routes.memory_stores import router as memory_stores_router
 from app.routes.memory_versions import router as memory_versions_router
 from app.routes.session_resources import router as session_resources_router
 from app.routes.sessions import router as sessions_router
+from app.routes.skills import router as skills_router
 from app.routes.vaults import router as vaults_router
 from app.routes.webhooks import router as webhooks_router
 from app.sandbox import DockerSandbox, ensure_docker_networks
@@ -211,6 +212,7 @@ v1_router.include_router(memories_router)
 v1_router.include_router(memory_versions_router)
 v1_router.include_router(sessions_router)
 v1_router.include_router(session_resources_router)
+v1_router.include_router(skills_router)
 v1_router.include_router(vaults_router)
 v1_router.include_router(webhooks_router)
 
