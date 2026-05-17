@@ -6,6 +6,58 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 _No unreleased changes yet._
 
+## [0.3.0] - 2026-05-16
+
+Memory stores — persistent, workspace-scoped, filesystem-mounted state that survives across sessions. The biggest single missing concept in Linchpin per RFC-0001's parity-gap analysis. Six PRs, one minor.
+
+### Added
+
+#### Memory stores + memories + memory versions
+
+- **`/v1/memory_stores`** — full CRUD (`POST/GET/PATCH`, `POST /{id}/archive`, `DELETE`, `?include_archived=true` on list). Workspace-scoped; `name` unique among live (non-archived) stores via a partial index.
+- **`/v1/memory_stores/{id}/memories`** — `POST/GET/PATCH/DELETE`, path-addressed (`/preferences/formatting.md`). 100 KB cap per memory (`MEMORY_MAX_BYTES_PER_MEMORY`); optimistic concurrency via `precondition: {type: "content_sha256", value: <sha>}` returning 412 with `expected_sha256` / `actual_sha256` on mismatch.
+- **`/v1/memory_stores/{id}/memory_versions`** — immutable snapshot per write (`action: create | update | delete | redact`). Filter by `memory_id`; binary content stream at `.../{ver}/content` (404 once redacted); explicit `POST .../{ver}/redact` zeros bytes + advances head if redacting the live one.
+- **`MemoryWriter`** — single canonical write path used by both the HTTP API (`author='api:<actor>'`) and the in-sandbox watcher (`author='session:<sid>'`). Bytes persisted via a dedicated `LocalFileStore` rooted at `LINCHPIN_MEMORY_ROOT` (default `/var/lib/linchpin/memory_stores/`) — content-addressed at `<sha[:2]>/<sha[2:4]>/<sha>`. Two writes of identical bytes share storage.
+
+#### Session integration
+
+- **`MemoryStoreResource`** entries in `resources[]`. Mount at `/mnt/memory/<store_name>/` with `ro`/`rw` based on the resource's `access` field. Per-session cap of 8 stores (`LINCHPIN_MEMORY_MAX_STORES_PER_SESSION`); duplicate stores in the same request are rejected at validation.
+- **Per-session host cache + bind mount.** On session create the store is materialized into `${TMPDIR}/linchpin-sessions/<sid>/memory/<name>/`, then bind-mounted into the container with kernel-enforced ro/rw. `terminate_session` wipes the cache and cancels the watcher.
+- **`<linchpin:memory>` system-prompt block.** Auto-prepended to the orchestrator's system prompt listing every mounted store with its access mode and instructions, so agents discover their persistent state without any caller-side prompt management.
+- **Per-(session, store) writeback watcher.** Read-write stores get one `watchfiles.awatch` task per store: agent writes inside `/mnt/memory/<name>/` flow through `MemoryWriter`, enforce the 100 KB cap with rollback (restore prior head bytes or unlink), refuse symlinks (exfiltration guard), dedupe via sha256 against the head. Read-only stores rely on the kernel ro bind — no watcher.
+
+#### Version retention + GC
+
+- **30-day default retention** (`LINCHPIN_MEMORY_VERSION_RETENTION_DAYS`, hard-capped at 365). Every version row carries an `expires_at` set at write time.
+- **`run_memory_gc()` + `cleanup_expired_memory_versions()`** — hourly batched GC pass (`LIMIT 5000` per tick, configurable via `LINCHPIN_MEMORY_GC_BATCH_SIZE`). Tombstones expired rows (zero sha, empty storage_path, `redacted_at` set) and unlinks the underlying FileStore object only when no other live version dedupes to the same path. `LINCHPIN_MEMORY_GC_INTERVAL_SEC` controls cadence; `LINCHPIN_MEMORY_GC=false` skips the task entirely.
+
+#### Resource fold-in
+
+- **`VaultResource`** in `resources[]` (`{type: "vault", vault_id: ...}`). The legacy top-level `vault_ids` field still parses; usage triggers `Linchpin-Deprecation: vault_ids` + a `session.deprecation_used` event (see Deprecated).
+
+### Events
+
+- `memory.write` — API or sandbox memory write with `memory_id`, `seq`, `author`, `action`, `path`.
+- `memory.write_rejected` — over-cap rollback from the sandbox watcher with `reason`, `size_bytes`.
+- `session.memory_mount_failed` — reserved for future boot-scan / mount-time failures.
+- `session.deprecation_used` — request used a shape slated for removal; payload carries `shape` + `migration` strings.
+
+### Schema migrations
+
+- `0010_memory_stores` — three tables (`memory_stores`, `memories`, `memory_versions`). Soft-delete with partial unique indexes: `memory_stores_name_idx ON (workspace_id, name) WHERE archived_at IS NULL`, `memories_path_idx ON (memory_store_id, path) WHERE deleted_at IS NULL`. Versions table has `seq` (monotonic per memory), `content_sha256`, `storage_path`, `action`, `redacted_at`, `expires_at`.
+
+### Deprecated
+
+See [`DEPRECATIONS.md`](./DEPRECATIONS.md) for full migration paths.
+
+- **New:** `vault_ids` on `CreateSessionRequest` — slated for removal in v0.4.0. Migrate to `resources: [{type: "vault", vault_id: ...}]` entries.
+- **Extended one minor:** the four v0.2.0 deprecations (`permission_policy` flat string, flat tools list, `session.requires_action` event, `agent.tool_use` for custom tools) were originally targeted for v0.3.0 removal but v0.3.0 ships inside the 60-day minimum-deprecation window of v0.2.0, so removal moves to **v0.4.0**.
+
+### Operator notes
+
+- `LINCHPIN_MEMORY_ROOT` defaults to `/var/lib/linchpin/memory_stores/` — give it durable storage. Distinct from `LINCHPIN_FILES_ROOT` so operators can put memory bytes on a different volume.
+- `LINCHPIN_MEMORY_GC=false` is safe for test/maintenance windows; canonical state is in the DB + FileStore and the cron is purely reclamation.
+
 ## [0.2.0] - 2026-05-15
 
 RFC-0001 Parity Phase A. Closes 13 of 14 scope items (item #4 limited-networking enforcement and breaking-bundle phase 2 ship in v0.2.x — surface lands here). Tag-and-release prepared from `main` once the four feature PRs landed.
