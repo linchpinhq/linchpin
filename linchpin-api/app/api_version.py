@@ -119,6 +119,9 @@ def mark_deprecation(response: Response, shape: str) -> None:
 DEPRECATED_AGENT_TOOLS_FLAT_LIST = "tools.flat-list"
 DEPRECATED_AGENT_PERMISSION_POLICY_STRING = "permission_policy.string"
 DEPRECATED_SESSION_REQUIRES_ACTION_EVENT = "session.requires_action.legacy"
+# v0.3 PR6 — vault_ids on CreateSessionRequest is deprecated; new shape
+# is ``resources: [{type: 'vault', vault_id: ...}]``. Target removal v0.4.
+DEPRECATED_SESSION_VAULT_IDS = "vault_ids"
 
 
 def permission_policy_v1_to_v2(value: str | dict | None) -> dict | None:

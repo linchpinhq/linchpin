@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sse_starlette.sse import EventSourceResponse
 
 from app.db import fetch_all, fetch_one, execute, listen, notify
@@ -50,6 +50,7 @@ from app.models import (
     SessionResponse,
     SessionStats,
     SessionUsage,
+    VaultResource,
 )
 
 logger = logging.getLogger("linchpin-api.sessions")
@@ -144,7 +145,9 @@ def _network_for_environment(config: dict) -> str:
 
 
 @router.post("", status_code=201, response_model=SessionResponse)
-async def create_session(body: CreateSessionRequest, request: Request) -> SessionResponse:
+async def create_session(
+    body: CreateSessionRequest, request: Request, response: Response
+) -> SessionResponse:
     """Create a new session: validate refs, provision container, insert record."""
     # Validate agent_id exists
     try:
@@ -178,9 +181,27 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
             detail={"error": "not_found", "message": f"Environment {body.environment_id} not found"},
         )
 
+    # v0.3 PR6 — vault_ids → resources[] fold-in. Accept both shapes:
+    # legacy ``vault_ids: [...]`` (deprecated) and ``resources: [{type:
+    # vault, vault_id: ...}]`` (new). Normalize to a single deduped list
+    # for validation and persistence. The original ``body.vault_ids``
+    # flag drives the deprecation signaling below; the union drives the
+    # vault existence + archive check.
+    legacy_vault_ids_supplied = bool(body.vault_ids)
+    vault_resources_from_resources = [
+        r.vault_id for r in body.resources if isinstance(r, VaultResource)
+    ]
+    seen: set[str] = set()
+    unified_vault_ids: list[str] = []
+    for vid in list(body.vault_ids) + vault_resources_from_resources:
+        if vid in seen:
+            continue
+        seen.add(vid)
+        unified_vault_ids.append(vid)
+
     # Validate vault_ids: each must exist and not be archived
-    if body.vault_ids:
-        for vid in body.vault_ids:
+    if unified_vault_ids:
+        for vid in unified_vault_ids:
             try:
                 vault_uid = uuid.UUID(vid)
             except ValueError:
@@ -331,6 +352,13 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                 "name": store_row["name"],
                 "description": store_row["description"],
             })
+        elif isinstance(resource, VaultResource):
+            # v0.3 PR6 — VaultResource entries piggy-back on the
+            # ``unified_vault_ids`` validation pass above. Skip per-
+            # resource work here so the parallel meta lists stay
+            # aligned with body.resources by index.
+            file_meta.append(None)
+            memory_meta.append(None)
         else:
             raise HTTPException(
                 status_code=501,
@@ -546,7 +574,10 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     try:
         agent_version = agent_row["version"]
         metadata_json = json.dumps(body.metadata)
-        vault_ids_json = json.dumps(body.vault_ids)
+        # v0.3 PR6 — persist the unified list (legacy vault_ids + any
+        # VaultResource entries pulled from resources[]). Storage column
+        # is unchanged; the fold-in only normalizes the input shape.
+        vault_ids_json = json.dumps(unified_vault_ids)
         stats_json = json.dumps({"total_events": 0, "tool_calls": 0, "model_turns": 0})
         # v0.2.0 item #10 — prompt-cache counters seeded alongside the existing two.
         usage_json = json.dumps({
@@ -623,6 +654,11 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
                     "access": resource.access,
                     "instructions": resource.instructions,
                 })
+            elif isinstance(resource, VaultResource):
+                # v0.3 PR6 — VaultResource doesn't get a session_resources
+                # row; the canonical surface is still sessions.vault_ids.
+                # The fold-in is purely an input-shape convenience.
+                continue
             else:
                 raise RuntimeError(
                     f"unexpected resource type {type(resource).__name__} reached persist loop"
@@ -668,6 +704,33 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
             except Exception:
                 # Best-effort: event log is not load-bearing for session boot.
                 logger.exception("failed to append session.resource_mount_failed event")
+
+        # v0.3 PR6 — vault_ids deprecation signal. When the caller sent
+        # the legacy ``vault_ids`` field (even an empty list won't trip
+        # because legacy_vault_ids_supplied was set off a truthy check),
+        # echo the deprecation back so SDKs can surface it to users and
+        # emit one session.deprecation_used event so a downstream audit
+        # query can see which clients are still on the old shape.
+        if legacy_vault_ids_supplied:
+            from app.api_version import (
+                DEPRECATED_SESSION_VAULT_IDS,
+                mark_deprecation,
+            )
+            mark_deprecation(response, DEPRECATED_SESSION_VAULT_IDS)
+            try:
+                await append_event(
+                    session_id,
+                    "session.deprecation_used",
+                    {
+                        "shape": DEPRECATED_SESSION_VAULT_IDS,
+                        "migration": (
+                            "Send vaults via resources[] entries with "
+                            "type='vault' instead. vault_ids removed in v0.4."
+                        ),
+                    },
+                )
+            except Exception:
+                logger.exception("failed to append session.deprecation_used event")
     except BaseException as create_exc:
         # Destroy the orphaned container before re-raising so we don't leak
         # docker resources on any DB/cancellation failure post-create. Use
