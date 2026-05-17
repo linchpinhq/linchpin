@@ -6,6 +6,51 @@ All notable changes to Linchpin are documented here. The format is based on [Kee
 
 _No unreleased changes yet._
 
+## [0.4.0] - 2026-05-16
+
+Skills — packaged expertise that progressively discloses to the agent. Pairs with v0.3.0's Memory: Memory is history, Skills is expertise. Three PRs.
+
+### Added
+
+#### Skills resource
+
+- **`/v1/skills`** — full surface: `POST /v1/skills` (multipart upload of tar.gz or zip, sniffed by magic bytes; 10 MB cap; SKILL.md frontmatter parsed + validated at upload), `GET /v1/skills` (paginated, `?include_archived=true`), `GET /v1/skills/{id}`, `DELETE /v1/skills/{id}` (soft).
+- **`SKILL.md` frontmatter spec.** `name` ≤64 chars, lowercase + digits + hyphen (no leading/trailing/consecutive hyphens, `anthropic`/`claude`/`linchpin` reserved). `description` ≤1024 chars.
+- **Content-addressable storage.** Bundle bytes persist under `LINCHPIN_SKILLS_ROOT` (default `/var/lib/linchpin/skills`) at `<sha[:2]>/<sha[2:4]>/<sha>.tar.gz`. Identical uploads dedupe.
+- **Re-upload same name updates** the existing row's bundle pointer — operators ship new revisions without churning the skill id.
+
+#### Agent integration
+
+- **`agent.skills[]`** — list of skill ids attached to an agent. `MAX_SKILLS_PER_AGENT = 8` enforced via Pydantic validator on Create/Update; duplicates rejected. POST/PATCH /v1/agents validate every skill id exists + isn't archived.
+- **Persisted on `agent_versions`** — when an agent is patched, the skill list is snapshotted alongside model / tools / mcp_servers so sessions pinned to a prior version see the exact skill set the agent was created with.
+
+#### Session integration
+
+- **Sandbox materialization.** At session create, each attached skill's bundle is unpacked into `$TMPDIR/linchpin-sessions/<sid>/skills/<name>/` (tar.gz or zip, with Python 3.12+ `data` filter for traversal safety), then bind-mounted into the container at `/mnt/skills/<name>/` read-only.
+- **Progressive disclosure.** Orchestrator's `build_context` prepends a `<linchpin:skills>` block to the system prompt with each skill's `name` + `description` + a read-pointer to `/mnt/skills/<name>/SKILL.md`. Level-1 metadata always in context; level-2 instructions via the agent's `read` tool; level-3 scripts via `bash`.
+- **Missing skills tolerated.** A skill deleted after the agent was patched is logged + skipped — the session still boots without it.
+- **`terminate_session` wipes the per-session skills cache root** alongside the memory and deliverables cleanup.
+
+#### CLI
+
+- **`linchpin` CLI** exposed via `[project.scripts]`. First verb: `linchpin skill build <path> [--output OUT] [--include-hidden]`.
+- Validates SKILL.md with the same parser the API uses on upload — a bundle that builds cleanly is guaranteed to upload cleanly.
+- Hidden files + common noise dirs (`.git`, `__pycache__`, `.DS_Store`, `node_modules`, …) excluded by default.
+
+#### Sample skill
+
+- `examples/skills/gh-pr/` — opens and updates GitHub pull requests using the `gh` CLI. Demonstrates the `SKILL.md` frontmatter shape and bundled-scripts pattern.
+
+### Schema migrations
+
+- `0011_skills` — `skills` table with partial unique index on `(workspace_id, name) WHERE archived_at IS NULL` and a `workspace_id` index.
+- `0012_agents_skills` — JSONB `skills` column on `agents` + `agent_versions`, default `'[]'`.
+
+### Operator notes
+
+- `LINCHPIN_SKILLS_ROOT` defaults to `/var/lib/linchpin/skills` — separate from Files / Memory roots so operators can put skill bundles on their own volume.
+- Skill bundle 10 MB cap (`SKILL_BUNDLE_MAX_BYTES`) — adjust in `app/models.py` if you ship larger bundles.
+
 ## [0.3.0] - 2026-05-16
 
 Memory stores — persistent, workspace-scoped, filesystem-mounted state that survives across sessions. The biggest single missing concept in Linchpin per RFC-0001's parity-gap analysis. Six PRs, one minor.
