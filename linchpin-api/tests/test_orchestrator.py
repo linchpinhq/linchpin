@@ -128,6 +128,66 @@ class TestBuildContext:
         assert messages[1] == {"role": "user", "content": "Hello"}
 
     @pytest.mark.asyncio
+    async def test_user_message_event_text_payload(self):
+        # The public SDK + README document the user-message shape as
+        # {text: "..."}. The orchestrator must accept that shape as well as
+        # {content: "..."} or text-shaped callers (Loopvalid) reach the
+        # model as empty strings — see PR #44 fix.
+        agent = _make_agent()
+        rows = [
+            {
+                "type": "user.message",
+                "payload": {"text": "Hello from text payload"},
+                "seq": 1,
+            }
+        ]
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
+            messages = await build_context(_SESSION_ID, agent)
+        assert len(messages) == 2
+        assert messages[1] == {"role": "user", "content": "Hello from text payload"}
+
+    @pytest.mark.asyncio
+    async def test_user_message_event_content_wins_over_text(self):
+        # If both keys are present, content wins (matches the prior behavior
+        # for callers that already supply content; text is the fallback).
+        agent = _make_agent()
+        rows = [
+            {
+                "type": "user.message",
+                "payload": {"content": "from content", "text": "from text"},
+                "seq": 1,
+            }
+        ]
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
+            messages = await build_context(_SESSION_ID, agent)
+        assert messages[1] == {"role": "user", "content": "from content"}
+
+    @pytest.mark.asyncio
+    async def test_user_message_empty_content_falls_back_to_text(self):
+        # Edge case: content key present but empty string. We treat that as
+        # "no content provided" and use text instead.
+        agent = _make_agent()
+        rows = [
+            {
+                "type": "user.message",
+                "payload": {"content": "", "text": "real message"},
+                "seq": 1,
+            }
+        ]
+        with (
+            patch("app.orchestrator.fetch_all", new_callable=AsyncMock, return_value=rows),
+            patch("app.orchestrator._build_memory_system_block", new_callable=AsyncMock, return_value=""),
+        ):
+            messages = await build_context(_SESSION_ID, agent)
+        assert messages[1] == {"role": "user", "content": "real message"}
+
+    @pytest.mark.asyncio
     async def test_agent_message_event(self):
         agent = _make_agent()
         rows = [
