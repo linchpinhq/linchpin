@@ -412,7 +412,13 @@ async def build_context(session_id: str, agent: Agent) -> list[dict]:
             # rewrite their shape. File-source resolution happens here
             # so providers see inline bytes rather than Linchpin-specific
             # file_id references.
-            content = payload.get("content", "")
+            # v0.5.1 — accept payload.text as well as payload.content. The
+            # public SDK + README document the user-message shape as
+            # {text}; the orchestrator was only reading {content}, causing
+            # text-shaped messages to reach the model as empty strings.
+            content = payload.get("content")
+            if content is None or content == "":
+                content = payload.get("text", "")
             if isinstance(content, list):
                 content = await _resolve_file_sources(content)
             messages.append({"role": "user", "content": content})
