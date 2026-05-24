@@ -818,6 +818,13 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
     """
     logger.info("Orchestrator started for session %s", session_id)
 
+    # Tracks whether the next iteration needs to block on LISTEN/NOTIFY for
+    # external input (a fresh user message), or whether we should re-enter
+    # the model loop immediately because we just wrote tool_results the model
+    # hasn't seen yet. Set to False after a tool dispatch round; True after
+    # idle transitions or session start.
+    needs_input = True
+
     while True:
         try:
             # 1. Load session from DB
@@ -828,12 +835,17 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
                 logger.info("Session %s is %s, orchestrator exiting.", session_id, status)
                 return
 
-            # 2. Wait for input event via LISTEN/NOTIFY
+            # 2. Wait for input event via LISTEN/NOTIFY — skipped when we
+            # have pending tool_results from the previous iteration that the
+            # model still needs to see. Without this skip, the loop would
+            # block here forever waiting for a notification that no one is
+            # going to send (the orchestrator wrote those events itself).
             channel = f"session_{session_id.replace('-', '_')}"
-            async for _payload in listen(channel):
-                break  # Got a notification, proceed
+            if needs_input:
+                async for _payload in listen(channel):
+                    break  # Got a notification, proceed
 
-            # Re-check status after waking up
+            # Re-check status after waking up (or after a no-wait re-entry)
             session = await load_session(session_id)
             status = session["status"]
             if status in ("terminated", "failed"):
@@ -1082,15 +1094,25 @@ async def run_session(session_id: str, sandbox: DockerSandbox) -> None:
                     })
 
             if interrupted:
+                needs_input = True
                 continue
 
-            # 11. If no tool calls (end_turn), transition to idle
+            # 11. If no tool calls (end_turn), transition to idle and wait
+            # for the next user message on the next iteration.
             if stop_reason == "end_turn" or not has_tool_calls:
                 await transition(session_id, "idle")
                 await append_event(session_id, "session.status_idle", {
                     "stop_reason": stop_reason or "end_turn",
                 })
-            # If tool calls were made, loop back (model will see tool results)
+                needs_input = True
+            else:
+                # Tool calls were dispatched (some or all of which may have
+                # returned errors). The model needs to see the tool_results
+                # we just wrote — re-enter the loop immediately without
+                # blocking on LISTEN, otherwise the session stalls until
+                # an external NOTIFY (which won't come, because we're the
+                # writer).
+                needs_input = False
 
         except ProviderError as exc:
             logger.error("Provider error in session %s: %s", session_id, exc)

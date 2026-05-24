@@ -485,6 +485,131 @@ class TestRunSessionToolUseAlwaysAllow:
         mock_dispatch.assert_called_once()
 
 
+class TestRunSessionToolErrorRecovery:
+    """After a tool returns an error, the orchestrator must re-enter the
+    model loop so the agent can react (apologize, retry with different args,
+    give up). Before this was fixed, the loop fell back to LISTEN/NOTIFY
+    and stalled forever because nothing was going to notify it — the
+    orchestrator itself wrote the tool_result event.
+    """
+
+    @pytest.mark.asyncio
+    async def test_continues_after_tool_returns_error(self):
+        agent = _make_agent(tools=[
+            BuiltinToolConfig(
+                type="builtin",
+                configs=[
+                    BuiltinToolItemConfig(name="bash", permission_policy="always_allow"),
+                ],
+            ),
+        ])
+        session_row = _make_session_row(status="idle")
+
+        # First model call: tool_use (will fail). Second model call: text
+        # response with end_turn (agent's reaction to the error). With the
+        # fix, both happen in a single LISTEN notification. Without the
+        # fix, the loop would block on the second LISTEN call indefinitely.
+        first_response = ModelResponse(
+            content=[
+                ContentBlock(
+                    type="tool_use",
+                    tool_use_id="tu1",
+                    tool_name="bash",
+                    tool_input={"command": "ls"},
+                ),
+            ],
+            stop_reason="tool_use",
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        )
+        second_response = ModelResponse(
+            content=[ContentBlock(type="text", text="Sorry, the bash tool errored. I'll stop here.")],
+            stop_reason="end_turn",
+            usage={"input_tokens": 20, "output_tokens": 12, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        )
+
+        from app.providers import StreamChunk
+        from tests.conftest import model_response_to_stream_chunks
+
+        chunks_1 = model_response_to_stream_chunks(first_response)
+        chunks_2 = model_response_to_stream_chunks(second_response)
+        call_idx = {"n": 0}
+
+        async def fake_send_streaming(*_args, **_kwargs):
+            call_idx["n"] += 1
+            chunks = chunks_1 if call_idx["n"] == 1 else chunks_2
+            for chunk in chunks:
+                yield chunk
+
+        mock_provider = MagicMock()
+        mock_provider.send_streaming = fake_send_streaming
+
+        appended_events = []
+
+        async def mock_append(sid, etype, payload):
+            appended_events.append((etype, payload))
+            return MagicMock(session_id=sid, cursor="c1", seq=1, type=etype, payload=payload, processed_at=None)
+
+        load_call_count = {"n": 0}
+
+        async def mock_load_session(sid):
+            load_call_count["n"] += 1
+            # Stay alive for 4 loads (2 iterations × 2 checks). On the 5th
+            # call return terminated so the orchestrator exits cleanly.
+            if load_call_count["n"] <= 4:
+                return session_row
+            return {**session_row, "status": "terminated"}
+
+        # Tool dispatch returns an error result — the trigger for recovery
+        mock_dispatch = AsyncMock(
+            return_value=('{"error": "bash failed in sandbox"}', "agent.tool_result"),
+        )
+
+        sandbox = MagicMock()
+
+        with (
+            patch("app.orchestrator.load_session", side_effect=mock_load_session),
+            patch("app.orchestrator.load_agent", new_callable=AsyncMock, return_value=agent),
+            # IMPORTANT: _listen_once yields exactly one notification. If the
+            # orchestrator tried to LISTEN a second time, the test would hang
+            # waiting for the next yield. Passing here is itself the fix
+            # verification.
+            patch("app.orchestrator.listen", side_effect=_listen_once()),
+            patch("app.orchestrator.append_event", side_effect=mock_append),
+            patch("app.orchestrator.transition", new_callable=AsyncMock),
+            patch("app.orchestrator.update_usage", new_callable=AsyncMock),
+            patch("app.orchestrator.get_provider", return_value=mock_provider),
+            patch("app.orchestrator.dispatch_tool", mock_dispatch),
+            patch("app.orchestrator.check_for_interrupt", new_callable=AsyncMock, return_value=False),
+            patch("app.orchestrator.build_context", new_callable=AsyncMock, return_value=[
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Run ls"},
+            ]),
+        ):
+            await run_session(_SESSION_ID, sandbox)
+
+        event_types = [e[0] for e in appended_events]
+
+        # The model was called twice (once for the initial tool_use, once
+        # for the recovery turn that produced end_turn).
+        assert call_idx["n"] == 2, f"model called {call_idx['n']} times, expected 2"
+        assert event_types.count("span.model_request_start") == 2
+        assert event_types.count("span.model_request_end") == 2
+
+        # The agent's recovery message + idle transition both landed.
+        recovery_messages = [
+            payload for etype, payload in appended_events
+            if etype == "agent.message"
+        ]
+        assert any(
+            "errored" in (m.get("content") or "")
+            for m in recovery_messages
+        ), f"expected an agent.message acknowledging the tool error; got {recovery_messages}"
+        assert "session.status_idle" in event_types
+
+        # And the tool was only dispatched once (no infinite loop).
+        mock_dispatch.assert_called_once()
+
+
 class TestRunSessionToolUseAlwaysAsk:
     """Tool use with always_ask → emit requires_action."""
 
