@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -186,13 +187,77 @@ async def _web_search(
     sandbox: DockerSandbox,
     container_id: str,
 ) -> dict[str, Any]:
-    """Req 13.8 — stub returning not-implemented message."""
+    """Web search via Tavily.
+
+    Reads TAVILY_API_KEY from the API process environment. If unset, returns
+    a clear configuration error rather than silently failing — same wording
+    as before the backend was wired, so existing tests/docs still match.
+
+    Tavily was picked as the default because:
+      * Purpose-built for LLM agents (returns clean snippets, not raw HTML)
+      * Free tier (1000 searches/month) covers typical agent demos
+      * Simple POST/JSON, no SDK needed
+
+    To swap backends, replace this function — the tool registry below
+    points at it by name.
+    """
+    query = tool_input.get("query")
+    if not query:
+        return {"error": "Missing required parameter: query"}
+
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return {
+            "error": (
+                "web_search backend not configured. Set TAVILY_API_KEY on "
+                "linchpin-api, or override _web_search in app/tools.py to "
+                "point at a different provider (Brave, SerpAPI, etc.)."
+            )
+        }
+
+    max_results = tool_input.get("max_results", 5)
+    if not isinstance(max_results, int) or max_results < 1 or max_results > 20:
+        max_results = 5
+
+    body = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": tool_input.get("search_depth", "basic"),
+        "max_results": max_results,
+        "include_answer": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post("https://api.tavily.com/search", json=body)
+    except httpx.HTTPError as exc:
+        return {"error": f"web_search HTTP error: {exc}"}
+
+    if resp.status_code != 200:
+        # Bubble Tavily's error body so the agent can react (rate-limited,
+        # bad query, etc.). With the orchestrator's tool-error recovery in
+        # place, the agent gets a chance to retry with different args.
+        return {
+            "error": f"web_search backend returned {resp.status_code}: "
+            f"{resp.text[:200]}"
+        }
+
+    data = resp.json()
+    # Normalize Tavily's response into a minimal shape the model can chew on
+    # without provider-specific knowledge.
+    results = [
+        {
+            "title": r.get("title"),
+            "url": r.get("url"),
+            "snippet": r.get("content"),
+            "score": r.get("score"),
+        }
+        for r in data.get("results", [])
+    ]
     return {
-        "error": (
-            "web_search is not implemented in MVP. "
-            "Configure it as a custom HTTP tool pointing at "
-            "Tavily, Brave, SerpAPI, etc."
-        )
+        "query": query,
+        "answer": data.get("answer"),
+        "results": results,
     }
 
 

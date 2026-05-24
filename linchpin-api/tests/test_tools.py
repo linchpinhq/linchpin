@@ -329,13 +329,98 @@ class TestWebFetchTool:
 
 class TestWebSearchTool:
     @pytest.mark.asyncio
-    async def test_returns_stub(self):
+    async def test_missing_query_returns_error(self):
+        sandbox = _make_sandbox()
+        result = await execute_builtin_tool(
+            "web_search", {}, sandbox, CONTAINER_ID
+        )
+        assert "error" in result
+        assert "query" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_backend_returns_helpful_error(self, monkeypatch):
+        # When TAVILY_API_KEY is unset, surface a clear configuration error
+        # rather than a 500 from Tavily — the agent (and operator reading
+        # logs) needs to know what to do.
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         sandbox = _make_sandbox()
         result = await execute_builtin_tool(
             "web_search", {"query": "test"}, sandbox, CONTAINER_ID
         )
         assert "error" in result
-        assert "not implemented" in result["error"]
+        assert "TAVILY_API_KEY" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_tavily_success_response_normalizes(self, monkeypatch):
+        # Real path: TAVILY_API_KEY set, Tavily returns 200 with results.
+        # Output is normalized into {query, answer, results[{title,url,snippet,score}]}
+        # so the model doesn't have to learn Tavily's specific JSON shape.
+        monkeypatch.setenv("TAVILY_API_KEY", "tav-test")
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "answer": "async standup tools are popular among remote teams",
+                    "results": [
+                        {
+                            "title": "Best async standup tools 2026",
+                            "url": "https://example.com/async-standup",
+                            "content": "Geekbot, Standuply, and several newer LLM-powered alternatives...",
+                            "score": 0.92,
+                        },
+                    ],
+                }
+
+        async def fake_post(self, url, **kwargs):
+            assert url == "https://api.tavily.com/search"
+            assert kwargs["json"]["api_key"] == "tav-test"
+            assert kwargs["json"]["query"] == "async standup tools"
+            return _FakeResp()
+
+        monkeypatch.setattr("httpx.AsyncClient.post", fake_post)
+        sandbox = _make_sandbox()
+        result = await execute_builtin_tool(
+            "web_search",
+            {"query": "async standup tools"},
+            sandbox,
+            CONTAINER_ID,
+        )
+        assert "error" not in result
+        assert result["query"] == "async standup tools"
+        assert result["answer"].startswith("async standup tools are popular")
+        assert len(result["results"]) == 1
+        assert result["results"][0]["title"] == "Best async standup tools 2026"
+        assert result["results"][0]["url"] == "https://example.com/async-standup"
+        assert result["results"][0]["snippet"].startswith("Geekbot")
+        assert result["results"][0]["score"] == 0.92
+
+    @pytest.mark.asyncio
+    async def test_tavily_non_200_surfaces_status(self, monkeypatch):
+        # Backend errors (rate limit, bad query, downtime) become a tool
+        # error the agent can react to. The orchestrator's tool-error
+        # recovery loop ensures this doesn't stall the session.
+        monkeypatch.setenv("TAVILY_API_KEY", "tav-test")
+
+        class _FakeResp:
+            status_code = 429
+            text = '{"error": "rate limited"}'
+
+            def json(self):
+                return {}
+
+        async def fake_post(self, url, **kwargs):
+            return _FakeResp()
+
+        monkeypatch.setattr("httpx.AsyncClient.post", fake_post)
+        sandbox = _make_sandbox()
+        result = await execute_builtin_tool(
+            "web_search", {"query": "test"}, sandbox, CONTAINER_ID
+        )
+        assert "error" in result
+        assert "429" in result["error"]
 
 
 # ---------------------------------------------------------------------------
